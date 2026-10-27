@@ -1,25 +1,2006 @@
-import { Button } from "@/components/ui/button";
-import { Loader2 } from "lucide-react";
-import { Streamdown } from 'streamdown';
+import { useEffect, useState } from "react";
+import { useLocation } from "wouter";
+import {
+  Activity,
+  ArrowUpRight,
+  CalendarDays,
+  Check,
+  CheckCircle2,
+  ChevronDown,
+  CircleHelp,
+  ClipboardList,
+  Clock3,
+  Download,
+  Heart,
+  Home as HomeIcon,
+  LogOut,
+  Menu,
+  Pill,
+  Plus,
+  ShieldCheck,
+  Users,
+  XCircle,
+  type LucideIcon,
+} from "lucide-react";
+import { toast } from "sonner";
+import { startLogin } from "@/const";
+import CareDialog, {
+  type CareDialogMode,
+  type FamilyMemberOption,
+} from "@/components/CareDialogs";
+import { trpc } from "@/lib/trpc";
 
-/**
- * All content in this page are only for example, replace with your own feature implementation
- * When building pages, remember your instructions in Frontend Workflow, Frontend Best Practices, Design Guide and Common Pitfalls
- */
+type Tab =
+  | "home"
+  | "tasks"
+  | "calendar"
+  | "medications"
+  | "journal"
+  | "family"
+  | "privacy";
+const tabTitles: Record<Tab, string> = {
+  home: "Overview",
+  tasks: "Family tasks",
+  calendar: "Calendar",
+  medications: "Medications",
+  journal: "Care journal",
+  family: "Family circle",
+  privacy: "Privacy & safety",
+};
+const todayKey = () => {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+};
+const shortDate = (value: Date | string | null | undefined) =>
+  value
+    ? new Date(value).toLocaleDateString("en-US", {
+        month: "short",
+        day: "numeric",
+      })
+    : "No due date";
+const dateTime = (value: Date | string | null | undefined) =>
+  value
+    ? new Date(value).toLocaleString("en-US", {
+        weekday: "short",
+        month: "short",
+        day: "numeric",
+        hour: "numeric",
+        minute: "2-digit",
+      })
+    : "Time not set";
+const reminderPreference = (minutes: number) => {
+  if (minutes === 0) return "No reminder";
+  if (minutes === 60) return "1 hour before";
+  if (minutes === 1440) return "1 day before";
+  if (minutes > 60 && minutes % 60 === 0) return `${minutes / 60} hours before`;
+  return `${minutes} minutes before`;
+};
+const initials = (name?: string | null) =>
+  (name || "Family member")
+    .trim()
+    .split(/\s+/)
+    .slice(0, 2)
+    .map(part => part[0]?.toUpperCase())
+    .join("") || "F";
+
+function Brand({ compact = false }: { compact?: boolean }) {
+  return (
+    <div className={`brand-lockup ${compact ? "brand-compact" : ""}`}>
+      <span className="brand-symbol">
+        <i />
+        <b />
+      </span>
+      <span className="brand-type">
+        <strong>care circle</strong>
+        <small>family care, shared</small>
+      </span>
+    </div>
+  );
+}
+function Spinner() {
+  return (
+    <div className="loading-state">
+      <span className="spinner" />
+      <span>Getting your family space ready…</span>
+    </div>
+  );
+}
+function EmptyState({
+  icon: Icon,
+  title,
+  body,
+  action,
+}: {
+  icon: LucideIcon;
+  title: string;
+  body: string;
+  action?: React.ReactNode;
+}) {
+  return (
+    <div className="empty-state">
+      <span className="empty-icon">
+        <Icon size={21} />
+      </span>
+      <h3>{title}</h3>
+      <p>{body}</p>
+      {action}
+    </div>
+  );
+}
+function Avatar({ name }: { name?: string | null }) {
+  return <span className="avatar">{initials(name)}</span>;
+}
+
 export default function Home() {
-  // If theme is switchable in App.tsx, we can implement theme toggling like this:
-  // const { theme, toggleTheme } = useTheme();
+  const [path, setPath] = useLocation();
+  const [activeTab, setActiveTab] = useState<Tab>("home");
+  const [calendarRange, setCalendarRange] = useState<"day" | "week">("week");
+  const [mobileMenu, setMobileMenu] = useState(false);
+  const [selectedId, setSelectedId] = useState<number | null>(() => {
+    const value = window.localStorage.getItem("care-circle-family");
+    return value ? Number(value) || null : null;
+  });
+  const [dialog, setDialog] = useState<CareDialogMode | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [inviteLink, setInviteLink] = useState("");
+
+  const me = trpc.auth.me.useQuery();
+  const isInvitationPath = path.startsWith("/invite/");
+  const invitationToken = isInvitationPath
+    ? path.slice("/invite/".length).split("/")[0] || ""
+    : "";
+  const invitation = trpc.care.invitations.preview.useQuery(
+    { token: invitationToken },
+    { enabled: invitationToken.length >= 32, retry: false }
+  );
+  const families = trpc.care.families.list.useQuery(undefined, {
+    enabled: !!me.data,
+  });
+  const familyId = selectedId ?? families.data?.[0]?.id ?? 0;
+  const currentFamily =
+    families.data?.find(family => family.id === familyId) ?? families.data?.[0];
+  const enabled = !!me.data && familyId > 0;
+  const tasks = trpc.care.tasks.list.useQuery({ familyId }, { enabled });
+  const medications = trpc.care.medications.list.useQuery(
+    { familyId, doseDate: todayKey() },
+    { enabled }
+  );
+  const events = trpc.care.events.list.useQuery({ familyId }, { enabled });
+  const notes = trpc.care.notes.list.useQuery({ familyId }, { enabled });
+  const members = trpc.care.families.members.useQuery(
+    { familyId },
+    { enabled }
+  );
+  const invitations = trpc.care.families.invitations.useQuery(
+    { familyId },
+    {
+      enabled:
+        enabled && ["owner", "coordinator"].includes(currentFamily?.role ?? ""),
+    }
+  );
+  const utils = trpc.useUtils();
+
+  useEffect(() => {
+    if (
+      families.data?.length &&
+      !families.data.some(family => family.id === selectedId)
+    )
+      setSelectedId(families.data[0].id);
+  }, [families.data, selectedId]);
+  useEffect(() => {
+    if (selectedId)
+      window.localStorage.setItem("care-circle-family", String(selectedId));
+  }, [selectedId]);
+  useEffect(() => {
+    if (!me.data || path !== "/") return;
+    const pendingPath = window.sessionStorage.getItem(
+      "care-circle-pending-invite"
+    );
+    if (pendingPath?.startsWith("/invite/")) {
+      window.sessionStorage.removeItem("care-circle-pending-invite");
+      setPath(pendingPath);
+    }
+  }, [me.data, path, setPath]);
+
+  const refresh = async () => {
+    await Promise.all([
+      utils.care.families.list.invalidate(),
+      ...(familyId
+        ? [
+            utils.care.tasks.list.invalidate({ familyId }),
+            utils.care.medications.list.invalidate({
+              familyId,
+              doseDate: todayKey(),
+            }),
+            utils.care.events.list.invalidate({ familyId }),
+            utils.care.notes.list.invalidate({ familyId }),
+            utils.care.families.members.invalidate({ familyId }),
+            utils.care.families.invitations.invalidate({ familyId }),
+          ]
+        : []),
+    ]);
+  };
+  const showError = (error: unknown) =>
+    toast.error(
+      error instanceof Error
+        ? error.message
+        : "That change could not be saved. Please try again."
+    );
+  const createFamily = trpc.care.families.create.useMutation();
+  const exportFamily = trpc.care.families.export.useMutation();
+  const createTask = trpc.care.tasks.create.useMutation();
+  const updateTask = trpc.care.tasks.update.useMutation();
+  const deleteTask = trpc.care.tasks.delete.useMutation();
+  const createMedication = trpc.care.medications.create.useMutation();
+  const updateMedication = trpc.care.medications.update.useMutation();
+  const confirmDose = trpc.care.medications.confirm.useMutation();
+  const createEvent = trpc.care.events.create.useMutation();
+  const createNote = trpc.care.notes.create.useMutation();
+  const createInvitation = trpc.care.families.invite.useMutation();
+  const acceptInvitation = trpc.care.invitations.accept.useMutation();
+  const declineInvitation = trpc.care.invitations.decline.useMutation();
+  const revokeInvitation = trpc.care.families.revokeInvitation.useMutation();
+  const changeRole = trpc.care.families.changeRole.useMutation();
+  const removeMember = trpc.care.families.removeMember.useMutation();
+  const leaveFamily = trpc.care.families.leave.useMutation();
+  const logout = trpc.auth.logout.useMutation();
+
+  const taskRows = tasks.data ?? [];
+  const medicationRows = medications.data ?? [];
+  const eventRows = events.data ?? [];
+  const noteRows = notes.data ?? [];
+  const memberRows = members.data ?? [];
+  const memberOptions: FamilyMemberOption[] = memberRows.map(member => ({
+    userId: member.userId,
+    name: member.name,
+    role: member.role,
+  }));
+  const now = new Date();
+  const isOverdue = (task: (typeof taskRows)[number]) =>
+    !!task.dueAt && new Date(task.dueAt) < now && task.status !== "completed";
+  const overdueCount = taskRows.filter(isOverdue).length;
+  const dueTodayCount = taskRows.filter(
+    task =>
+      task.dueAt &&
+      new Date(task.dueAt).toDateString() === now.toDateString() &&
+      task.status !== "completed"
+  ).length;
+  const unassignedCount = taskRows.filter(
+    task => !task.assigneeId && task.status !== "completed"
+  ).length;
+  const unconfirmedCount = medicationRows.filter(med => !med.today).length;
+  const nextEvent = eventRows.find(event => new Date(event.startsAt) >= now);
+  const queryError =
+    tasks.error ||
+    medications.error ||
+    events.error ||
+    notes.error ||
+    members.error;
+
+  const signIn = () => {
+    if (isInvitationPath)
+      window.sessionStorage.setItem("care-circle-pending-invite", path);
+    try {
+      startLogin();
+    } catch (error) {
+      showError(error);
+    }
+  };
+  const onFamilyCreate = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const name = String(form.get("name") ?? "").trim();
+    if (name.length < 2) return toast.error("Please enter a family name.");
+    try {
+      const family = await createFamily.mutateAsync({ name });
+      setSelectedId(family.id);
+      await utils.care.families.list.invalidate();
+      toast.success("Your family space is ready.");
+    } catch (error) {
+      showError(error);
+    }
+  };
+
+  const downloadFamilyExport = async () => {
+    try {
+      const data = await exportFamily.mutateAsync({ familyId });
+      const file = new Blob([JSON.stringify(data, null, 2)], {
+        type: "application/json",
+      });
+      const url = URL.createObjectURL(file);
+      const link = document.createElement("a");
+      const familySlug = (currentFamily?.name || "family")
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-|-$/g, "");
+      link.href = url;
+      link.download = `care-circle-${familySlug || "family"}-${todayKey()}.json`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+      toast.success("A JSON export for this family was downloaded.");
+    } catch (error) {
+      showError(error);
+    }
+  };
+
+  const submitDialog = async (
+    kind: CareDialogMode["kind"],
+    values: Record<string, string>
+  ) => {
+    if (!familyId && kind !== "invite") return;
+    setBusy(true);
+    const assignment = values.assigneeId ? Number(values.assigneeId) : null;
+    try {
+      if (kind === "task") {
+        const mode = dialog?.kind === "task" ? dialog : null;
+        const fields = {
+          familyId,
+          title: values.title.trim(),
+          description: values.description || null,
+          dueAt: values.dueAt ? new Date(values.dueAt) : null,
+          priority: values.priority as "low" | "medium" | "high",
+          assigneeId: assignment,
+          recurrence: values.recurrence as
+            | "none"
+            | "daily"
+            | "weekly"
+            | "monthly",
+          notes: values.notes || null,
+        };
+        if (mode?.item)
+          await updateTask.mutateAsync({
+            ...fields,
+            taskId: mode.item.id,
+            status: (values.status || mode.item.status) as
+              | "new"
+              | "in_progress"
+              | "completed",
+          });
+        else await createTask.mutateAsync(fields);
+        toast.success(
+          mode?.item ? "Task updated." : "Task added to your family list."
+        );
+      } else if (kind === "medication") {
+        const mode = dialog?.kind === "medication" ? dialog : null;
+        const fields = {
+          familyId,
+          name: values.name.trim(),
+          dose: values.dose.trim(),
+          schedule: values.schedule.trim(),
+          startDate: values.startDate || null,
+          endDate: values.endDate || null,
+          notes: values.notes || null,
+          assigneeId: assignment,
+        };
+        if (mode?.item)
+          await updateMedication.mutateAsync({
+            ...fields,
+            medicationId: mode.item.id,
+            active: values.active === "on",
+          });
+        else await createMedication.mutateAsync(fields);
+        toast.success(
+          mode?.item
+            ? "Medication details updated."
+            : "Medication added to the family list."
+        );
+      } else if (kind === "event") {
+        await createEvent.mutateAsync({
+          familyId,
+          title: values.title.trim(),
+          kind: values.kind as "appointment" | "visit",
+          startsAt: new Date(values.startsAt),
+          location: values.location || null,
+          escortId: assignment,
+          reminderMinutes: Number(values.reminderMinutes),
+          questions: values.questions || null,
+          visitNotes: values.visitNotes || null,
+        });
+        toast.success("Appointment added to the family calendar.");
+      } else if (kind === "note") {
+        await createNote.mutateAsync({
+          familyId,
+          kind: values.kind as
+            | "update"
+            | "visit_note"
+            | "question"
+            | "handoff"
+            | "need",
+          body: values.body.trim(),
+          isConfirmedFact: values.isConfirmedFact === "on",
+        });
+        toast.success("Journal entry shared with your family.");
+      } else if (kind === "invite") {
+        const result = await createInvitation.mutateAsync({
+          familyId,
+          email: values.email.trim() || null,
+          role: values.role as "coordinator" | "caregiver" | "viewer",
+        });
+        const link = `${window.location.origin}/invite/${result.token}`;
+        setInviteLink(link);
+        try {
+          await navigator.clipboard.writeText(link);
+          toast.success(
+            "Invitation link created and copied. Share it directly; no email was sent."
+          );
+        } catch {
+          toast.success(
+            "Invitation link created. Copy it below and share it directly; no email was sent."
+          );
+        }
+      } else if (kind === "dose" && dialog?.kind === "dose") {
+        await confirmDose.mutateAsync({
+          familyId,
+          medicationId: dialog.medicationId,
+          doseDate: todayKey(),
+          note: values.note || null,
+        });
+        toast.success(
+          values.note
+            ? "Confirmation recorded with a follow-up note."
+            : "Confirmation recorded."
+        );
+      }
+      await refresh();
+      if (kind !== "invite") setDialog(null);
+    } catch (error) {
+      showError(error);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const changeTaskStatus = async (
+    task: (typeof taskRows)[number],
+    status: "new" | "in_progress" | "completed"
+  ) => {
+    try {
+      await updateTask.mutateAsync({
+        familyId,
+        taskId: task.id,
+        title: task.title,
+        description: task.description,
+        dueAt: task.dueAt ? new Date(task.dueAt) : null,
+        priority: task.priority,
+        assigneeId: task.assigneeId,
+        recurrence: task.recurrence,
+        notes: task.notes,
+        status,
+      });
+      await refresh();
+      toast.success(
+        status === "completed"
+          ? "Task marked complete."
+          : "Task status updated."
+      );
+    } catch (error) {
+      showError(error);
+    }
+  };
+
+  if (me.isLoading)
+    return (
+      <div className="auth-loading">
+        <Brand />
+        <Spinner />
+      </div>
+    );
+  if (!me.data)
+    return (
+      <Landing
+        signIn={signIn}
+        error={
+          me.error
+            ? "We could not check your account right now. Please retry."
+            : ""
+        }
+      />
+    );
+
+  if (isInvitationPath) {
+    const join = async (accept: boolean) => {
+      try {
+        const result = await (accept
+          ? acceptInvitation.mutateAsync({ token: invitationToken })
+          : declineInvitation.mutateAsync({ token: invitationToken }));
+        if (accept) {
+          setSelectedId(result.familyId);
+          toast.success(`You joined ${result.familyName}.`);
+          await utils.care.families.list.invalidate();
+        } else toast.success("Invitation declined.");
+        setPath("/");
+      } catch (error) {
+        showError(error);
+      }
+    };
+    return (
+      <div className="invite-screen">
+        <Brand />
+        <section className="invite-card">
+          <span className="soft-icon">
+            <Users size={22} />
+          </span>
+          <span className="eyebrow">FAMILY INVITATION</span>
+          {invitation.isLoading ? (
+            <Spinner />
+          ) : invitation.data ? (
+            <>
+              <h1>Join {invitation.data.familyName}</h1>
+              <p>
+                You’ve been invited to join this family’s care circle as a{" "}
+                <strong>{invitation.data.role}</strong>
+                {invitation.data.email ? ` · for ${invitation.data.email}` : ""}
+                . Access is limited to members of this family.
+              </p>
+              <div className="invite-actions">
+                <button
+                  className="button button-primary"
+                  onClick={() => join(true)}
+                  disabled={acceptInvitation.isPending}
+                >
+                  Accept invitation
+                </button>
+                <button
+                  className="button button-subtle"
+                  onClick={() => join(false)}
+                  disabled={declineInvitation.isPending}
+                >
+                  Decline
+                </button>
+              </div>
+            </>
+          ) : (
+            <>
+              <h1>This invitation is unavailable</h1>
+              <p>
+                It may have expired, been revoked, or already been used. Ask a
+                family coordinator for a new link.
+              </p>
+              <button
+                className="button button-subtle"
+                onClick={() => setPath("/")}
+              >
+                Go to my family space
+              </button>
+            </>
+          )}
+        </section>
+        <p className="invite-footnote">
+          Care Circle helps families coordinate care. It is not a medical or
+          emergency service.
+        </p>
+      </div>
+    );
+  }
+
+  if (families.isLoading)
+    return (
+      <div className="auth-loading">
+        <Brand />
+        <Spinner />
+      </div>
+    );
+  if (!families.data?.length)
+    return (
+      <div className="onboarding-screen">
+        <Brand />
+        <section className="onboarding-card">
+          <span className="soft-icon">
+            <Heart size={22} />
+          </span>
+          <span className="eyebrow">A PLACE FOR THE WHOLE FAMILY</span>
+          <h1>Care feels lighter when it’s shared.</h1>
+          <p>
+            Create a private family space to keep everyday tasks, appointments,
+            medication confirmations and care notes together.
+          </p>
+          <form onSubmit={onFamilyCreate}>
+            <label className="field">
+              <span>What should your family space be called?</span>
+              <input
+                name="name"
+                required
+                minLength={2}
+                maxLength={160}
+                placeholder="e.g. The Johnson family"
+              />
+            </label>
+            <button
+              className="button button-primary full-button"
+              disabled={createFamily.isPending}
+            >
+              {createFamily.isPending ? "Creating…" : "Create family space"}
+            </button>
+          </form>
+          <div className="safe-note">
+            <ShieldCheck size={17} />
+            <span>
+              Only members you invite can see this family’s information.
+            </span>
+          </div>
+        </section>
+      </div>
+    );
+
+  if (queryError)
+    return (
+      <div className="error-screen">
+        <Brand />
+        <div className="error-card">
+          <XCircle size={28} />
+          <h2>Family information didn’t load</h2>
+          <p>
+            {queryError.message ||
+              "Please check your connection and try again."}
+          </p>
+          <button className="button button-primary" onClick={() => refresh()}>
+            Try again
+          </button>
+        </div>
+      </div>
+    );
+
+  const navItems: {
+    id: Tab;
+    title: string;
+    icon: LucideIcon;
+    badge?: number;
+  }[] = [
+    { id: "home", title: "Overview", icon: HomeIcon },
+    {
+      id: "tasks",
+      title: "Tasks",
+      icon: ClipboardList,
+      badge: overdueCount + unassignedCount,
+    },
+    { id: "calendar", title: "Calendar", icon: CalendarDays },
+    {
+      id: "medications",
+      title: "Medications",
+      icon: Pill,
+      badge: unconfirmedCount,
+    },
+    { id: "journal", title: "Care journal", icon: Activity },
+    { id: "family", title: "Family circle", icon: Users },
+  ];
+  const canCoordinate = ["owner", "coordinator"].includes(
+    currentFamily?.role ?? ""
+  );
+  const canWrite = currentFamily?.role !== "viewer";
+  const openTask = (task?: (typeof taskRows)[number]) =>
+    setDialog(task ? { kind: "task", item: task } : { kind: "task" });
+  const openMedication = (medication?: (typeof medicationRows)[number]) =>
+    setDialog(
+      medication
+        ? { kind: "medication", item: medication }
+        : { kind: "medication" }
+    );
+  const outstandingTasks = taskRows.filter(task => task.status !== "completed");
+  const sortedTasks = [...outstandingTasks].sort(
+    (a, b) =>
+      Number(isOverdue(b)) - Number(isOverdue(a)) ||
+      new Date(a.dueAt ?? "9999-12-31").getTime() -
+        new Date(b.dueAt ?? "9999-12-31").getTime()
+  );
+  const upcomingEvents = eventRows.filter(
+    event => new Date(event.startsAt) >= now
+  );
+  const weekLimit = new Date(now);
+  weekLimit.setDate(weekLimit.getDate() + 7);
+  const visibleEvents = upcomingEvents.filter(event =>
+    calendarRange === "day"
+      ? new Date(event.startsAt).toDateString() === now.toDateString()
+      : new Date(event.startsAt) < weekLimit
+  );
+  const displayName = me.data.name?.trim().split(/\s+/)[0] || "there";
 
   return (
-    <div className="min-h-screen flex flex-col">
-      <main>
-        {/* Example: lucide-react for icons */}
-        <Loader2 className="animate-spin" />
-        Example Page
-        {/* Example: Streamdown for markdown rendering */}
-        <Streamdown>Any **markdown** content</Streamdown>
-        <Button variant="default">Example Button</Button>
+    <div className="app-shell">
+      <aside className={`sidebar ${mobileMenu ? "sidebar-open" : ""}`}>
+        <div className="sidebar-brand">
+          <Brand />
+        </div>
+        <div className="side-family">
+          <span className="eyebrow">YOUR CARE CIRCLE</span>
+          <div className="family-select-wrap">
+            <Heart size={16} />
+            <select
+              aria-label="Choose family"
+              value={currentFamily?.id ?? ""}
+              onChange={event => setSelectedId(Number(event.target.value))}
+            >
+              {families.data.map(family => (
+                <option value={family.id} key={family.id}>
+                  {family.name}
+                </option>
+              ))}
+            </select>
+            <ChevronDown size={14} />
+          </div>
+          <span className="role-label">{currentFamily?.role} access</span>
+        </div>
+        <nav className="side-nav" aria-label="Main navigation">
+          {navItems.map(item => (
+            <button
+              key={item.id}
+              className={`nav-link ${activeTab === item.id ? "active" : ""}`}
+              onClick={() => {
+                setActiveTab(item.id);
+                setMobileMenu(false);
+              }}
+            >
+              <item.icon size={18} strokeWidth={1.8} />
+              <span>{item.title}</span>
+              {!!item.badge && item.badge > 0 && (
+                <span className="nav-badge">{item.badge}</span>
+              )}
+            </button>
+          ))}
+        </nav>
+        <div className="sidebar-bottom">
+          <button
+            className={`nav-link privacy-link ${activeTab === "privacy" ? "active" : ""}`}
+            onClick={() => setActiveTab("privacy")}
+          >
+            <ShieldCheck size={17} />
+            <span>Privacy & safety</span>
+          </button>
+          <div className="profile-block">
+            <Avatar name={me.data.name} />
+            <span className="profile-copy">
+              <strong>{me.data.name || "Family member"}</strong>
+              <small>{me.data.email || "Signed in with Manus"}</small>
+            </span>
+            <button
+              className="icon-button logout-button"
+              aria-label="Sign out"
+              title="Sign out"
+              onClick={() =>
+                logout.mutate(undefined, {
+                  onSuccess: () => {
+                    utils.auth.me.invalidate();
+                    toast.success("You’re signed out.");
+                  },
+                  onError: showError,
+                })
+              }
+            >
+              <LogOut size={17} />
+            </button>
+          </div>
+          <p className="sidebar-disclaimer">
+            For family coordination only. Not a medical or emergency service.
+          </p>
+        </div>
+      </aside>
+      {mobileMenu && (
+        <button
+          className="mobile-scrim"
+          aria-label="Close menu"
+          onClick={() => setMobileMenu(false)}
+        />
+      )}
+      <main className="main-area">
+        <header className="topbar">
+          <button
+            className="mobile-menu-button icon-button"
+            aria-label="Open menu"
+            onClick={() => setMobileMenu(true)}
+          >
+            <Menu size={21} />
+          </button>
+          <div className="breadcrumb">
+            <span>{currentFamily?.name}</span>
+            <span className="breadcrumb-slash">/</span>
+            <strong>{tabTitles[activeTab]}</strong>
+          </div>
+          <div className="topbar-right">
+            <span className="today-label">
+              {new Date().toLocaleDateString("en-US", {
+                weekday: "short",
+                month: "short",
+                day: "numeric",
+              })}
+            </span>
+            <Avatar name={me.data.name} />
+          </div>
+        </header>
+        <div className="page-content">
+          <div className="page-heading">
+            <div>
+              <span className="eyebrow">
+                {activeTab === "home"
+                  ? `GOOD ${now.getHours() < 12 ? "MORNING" : now.getHours() < 18 ? "AFTERNOON" : "EVENING"}, ${displayName.toUpperCase()}`
+                  : currentFamily?.name.toUpperCase()}
+              </span>
+              <h1>
+                {activeTab === "home"
+                  ? "Care, shared clearly."
+                  : tabTitles[activeTab]}
+              </h1>
+              <p>
+                {activeTab === "home"
+                  ? "A steady place to see what’s next and who’s taking care of it."
+                  : pageSubtitle(activeTab)}
+              </p>
+            </div>
+            {canWrite && activeTab !== "privacy" && activeTab !== "family" && (
+              <button
+                className="button button-primary add-button"
+                onClick={() =>
+                  setDialog(
+                    activeTab === "tasks" || activeTab === "home"
+                      ? { kind: "task" }
+                      : activeTab === "medications"
+                        ? { kind: "medication" }
+                        : activeTab === "calendar"
+                          ? { kind: "event" }
+                          : { kind: "note" }
+                  )
+                }
+              >
+                <Plus size={17} />
+                {activeTab === "calendar"
+                  ? "Add event"
+                  : activeTab === "medications"
+                    ? "Add medication"
+                    : activeTab === "journal"
+                      ? "Add update"
+                      : "Add task"}
+              </button>
+            )}
+          </div>
+
+          {activeTab === "home" && (
+            <>
+              <section className="stats-row" aria-label="Family care summary">
+                <StatCard
+                  icon={ClipboardList}
+                  label="Due today"
+                  value={dueTodayCount}
+                  tone="sage"
+                  detail="Open tasks scheduled for today"
+                  onClick={() => setActiveTab("tasks")}
+                />
+                <StatCard
+                  icon={Clock3}
+                  label="Past due"
+                  value={overdueCount}
+                  tone={overdueCount ? "sand" : "sage"}
+                  detail={
+                    overdueCount
+                      ? "Needs a family check-in"
+                      : "You’re all caught up"
+                  }
+                  onClick={() => setActiveTab("tasks")}
+                />
+                <StatCard
+                  icon={Users}
+                  label="Unassigned"
+                  value={unassignedCount}
+                  tone={unassignedCount ? "lavender" : "sage"}
+                  detail="Tasks without a caregiver"
+                  onClick={() => setActiveTab("tasks")}
+                />
+                <StatCard
+                  icon={Pill}
+                  label="Not confirmed today"
+                  value={unconfirmedCount}
+                  tone={unconfirmedCount ? "peach" : "sage"}
+                  detail="No confirmation recorded yet"
+                  onClick={() => setActiveTab("medications")}
+                />
+              </section>
+              <div className="dashboard-columns">
+                <section className="panel task-panel">
+                  <PanelTitle
+                    title="What needs doing"
+                    caption={`${outstandingTasks.length} open ${outstandingTasks.length === 1 ? "task" : "tasks"}`}
+                    action="All tasks"
+                    onAction={() => setActiveTab("tasks")}
+                  />
+                  {sortedTasks.length ? (
+                    <div className="task-list">
+                      {sortedTasks.slice(0, 5).map(task => (
+                        <TaskRow
+                          key={task.id}
+                          task={task}
+                          isOverdue={isOverdue(task)}
+                          onEdit={() => openTask(task)}
+                          onComplete={() => changeTaskStatus(task, "completed")}
+                          readOnly={!canWrite}
+                        />
+                      ))}
+                    </div>
+                  ) : (
+                    <EmptyState
+                      icon={CheckCircle2}
+                      title="Nothing urgent on the list"
+                      body="Add a task when your family needs to coordinate the next step."
+                      action={
+                        canWrite && (
+                          <button
+                            className="text-action"
+                            onClick={() => openTask()}
+                          >
+                            Add a task <ArrowUpRight size={14} />
+                          </button>
+                        )
+                      }
+                    />
+                  )}
+                </section>
+                <section className="panel up-next-panel">
+                  <PanelTitle
+                    title="Coming up"
+                    caption="Appointments & visits"
+                    action="Calendar"
+                    onAction={() => setActiveTab("calendar")}
+                  />
+                  {nextEvent ? (
+                    <div className="next-event">
+                      <div className="event-date-tile">
+                        <span>
+                          {new Date(nextEvent.startsAt).toLocaleDateString(
+                            "en-US",
+                            { month: "short" }
+                          )}
+                        </span>
+                        <strong>
+                          {new Date(nextEvent.startsAt).getDate()}
+                        </strong>
+                      </div>
+                      <div>
+                        <span className="event-kind">
+                          {nextEvent.kind === "appointment"
+                            ? "MEDICAL APPOINTMENT"
+                            : "FAMILY VISIT"}
+                        </span>
+                        <h3>{nextEvent.title}</h3>
+                        <p>{dateTime(nextEvent.startsAt)}</p>
+                        {nextEvent.location && (
+                          <small>{nextEvent.location}</small>
+                        )}
+                      </div>
+                    </div>
+                  ) : (
+                    <EmptyState
+                      icon={CalendarDays}
+                      title="No upcoming visits yet"
+                      body="Keep the family in sync by adding an appointment or visit."
+                      action={
+                        <button
+                          className="text-action"
+                          onClick={() => setDialog({ kind: "event" })}
+                        >
+                          Add to calendar <ArrowUpRight size={14} />
+                        </button>
+                      }
+                    />
+                  )}
+                  <div className="upnext-divider" />
+                  <div className="mini-med-title">
+                    <span className="mini-icon">
+                      <Pill size={16} />
+                    </span>
+                    <div>
+                      <strong>Medication check-in</strong>
+                      <small>
+                        {unconfirmedCount
+                          ? `${unconfirmedCount} confirmation${unconfirmedCount === 1 ? "" : "s"} not recorded today`
+                          : "Every active medication has a confirmation today"}
+                      </small>
+                    </div>
+                    <button
+                      className="icon-button"
+                      aria-label="Open medication list"
+                      onClick={() => setActiveTab("medications")}
+                    >
+                      <ArrowUpRight size={16} />
+                    </button>
+                  </div>
+                </section>
+              </div>
+              <section className="panel journal-preview">
+                <PanelTitle
+                  title="Latest family updates"
+                  caption="Care journal"
+                  action="Open journal"
+                  onAction={() => setActiveTab("journal")}
+                />
+                {noteRows.length ? (
+                  <div className="journal-preview-list">
+                    {noteRows.slice(0, 3).map(note => (
+                      <JournalEntry key={note.id} note={note} compact />
+                    ))}
+                  </div>
+                ) : (
+                  <div className="journal-empty">
+                    <span>
+                      Leave a short note for the next person stepping in.
+                    </span>
+                    <button
+                      className="text-action"
+                      onClick={() => setDialog({ kind: "note" })}
+                    >
+                      Add an update <Plus size={14} />
+                    </button>
+                  </div>
+                )}
+              </section>
+              <p className="dashboard-footnote">
+                <ShieldCheck size={15} /> Medication confirmations are
+                family-entered records, not verification. Care Circle does not
+                provide medical advice or emergency response.
+              </p>
+            </>
+          )}
+
+          {activeTab === "tasks" && (
+            <section className="panel full-panel">
+              <PanelTitle
+                title="Shared task list"
+                caption="One owner, one next step"
+                action={canWrite ? "Add a task" : undefined}
+                onAction={() => openTask()}
+              />
+              {taskRows.length ? (
+                <div className="task-list">
+                  {[...taskRows]
+                    .sort(
+                      (a, b) =>
+                        Number(isOverdue(b)) - Number(isOverdue(a)) ||
+                        Number(a.status === "completed") -
+                          Number(b.status === "completed") ||
+                        new Date(a.dueAt ?? "9999-12-31").getTime() -
+                          new Date(b.dueAt ?? "9999-12-31").getTime()
+                    )
+                    .map(task => (
+                      <TaskRow
+                        key={task.id}
+                        task={task}
+                        isOverdue={isOverdue(task)}
+                        onEdit={() => openTask(task)}
+                        onComplete={() =>
+                          changeTaskStatus(
+                            task,
+                            task.status === "completed"
+                              ? "in_progress"
+                              : "completed"
+                          )
+                        }
+                        onDelete={async () => {
+                          if (
+                            !window.confirm(
+                              `Delete “${task.title}”? This cannot be undone.`
+                            )
+                          )
+                            return;
+                          try {
+                            await deleteTask.mutateAsync({
+                              familyId,
+                              taskId: task.id,
+                            });
+                            await refresh();
+                            toast.success("Task deleted.");
+                          } catch (error) {
+                            showError(error);
+                          }
+                        }}
+                        showDelete={canCoordinate}
+                        readOnly={!canWrite}
+                      />
+                    ))}
+                </div>
+              ) : (
+                <EmptyState
+                  icon={ClipboardList}
+                  title="Your shared list starts here"
+                  body="Add a practical task so everyone knows what needs doing, when, and who has it."
+                  action={
+                    canWrite && (
+                      <button
+                        className="button button-primary"
+                        onClick={() => openTask()}
+                      >
+                        <Plus size={16} />
+                        Add a task
+                      </button>
+                    )
+                  }
+                />
+              )}
+              <div className="list-legend">
+                <span className="status-dot dot-overdue" />
+                Past due is based on its due time, unless the task is complete.
+                <span className="legend-divider" />
+                <Users size={14} />
+                {unassignedCount} without an owner
+              </div>
+            </section>
+          )}
+
+          {activeTab === "calendar" && (
+            <section className="panel full-panel">
+              <PanelTitle
+                title="Appointments & visits"
+                caption="Shared by your family"
+                action={canWrite ? "Add an event" : undefined}
+                onAction={() => setDialog({ kind: "event" })}
+              />
+              <div
+                className="calendar-view-switch"
+                role="tablist"
+                aria-label="Calendar range"
+              >
+                <button
+                  role="tab"
+                  aria-selected={calendarRange === "day"}
+                  className={calendarRange === "day" ? "selected" : ""}
+                  onClick={() => setCalendarRange("day")}
+                >
+                  Today
+                </button>
+                <button
+                  role="tab"
+                  aria-selected={calendarRange === "week"}
+                  className={calendarRange === "week" ? "selected" : ""}
+                  onClick={() => setCalendarRange("week")}
+                >
+                  Next 7 days
+                </button>
+              </div>
+              {visibleEvents.length ? (
+                <div className="event-list">
+                  {visibleEvents.map(event => (
+                    <article className="event-row" key={event.id}>
+                      <div className="event-date-tile">
+                        <span>
+                          {new Date(event.startsAt).toLocaleDateString(
+                            "en-US",
+                            { month: "short" }
+                          )}
+                        </span>
+                        <strong>{new Date(event.startsAt).getDate()}</strong>
+                      </div>
+                      <div className="event-row-body">
+                        <span className="event-kind">
+                          {event.kind === "appointment"
+                            ? "MEDICAL APPOINTMENT"
+                            : "FAMILY VISIT"}
+                        </span>
+                        <h3>{event.title}</h3>
+                        <p>{dateTime(event.startsAt)}</p>
+                        {event.location && <small>{event.location}</small>}
+                        {event.escortName && (
+                          <small className="escort-label">
+                            Accompanying: {event.escortName}
+                          </small>
+                        )}
+                        {event.questions && (
+                          <details>
+                            <summary>Questions for the clinician</summary>
+                            <p>{event.questions}</p>
+                          </details>
+                        )}
+                        {event.visitNotes && (
+                          <details>
+                            <summary>Visit notes</summary>
+                            <p>{event.visitNotes}</p>
+                          </details>
+                        )}
+                      </div>
+                      <span className="reminder-pill">
+                        <Clock3 size={13} />
+                        {reminderPreference(event.reminderMinutes)}
+                      </span>
+                    </article>
+                  ))}
+                </div>
+              ) : (
+                <EmptyState
+                  icon={CalendarDays}
+                  title="No events on the calendar"
+                  body="Add medical appointments and family visits with the time, place and person accompanying."
+                  action={
+                    canWrite && (
+                      <button
+                        className="button button-primary"
+                        onClick={() => setDialog({ kind: "event" })}
+                      >
+                        <Plus size={16} />
+                        Add an event
+                      </button>
+                    )
+                  }
+                />
+              )}
+              <p className="form-hint calendar-hint">
+                Calendar times use your device’s local time. Reminder
+                preferences are saved, but this first stage does not send
+                notifications.
+              </p>
+            </section>
+          )}
+
+          {activeTab === "medications" && (
+            <>
+              <div className="notice-banner">
+                <span className="notice-icon">
+                  <Pill size={17} />
+                </span>
+                <p>
+                  <strong>Family tracking only.</strong> Follow the clinician’s
+                  instructions. A reminder or open screen is not confirmation,
+                  and this app does not verify whether a dose was given. No
+                  automated reminders are sent in this stage. One check-in is
+                  recorded per medication per local date; multiple daily doses
+                  are not tracked as separate entries here.
+                </p>
+              </div>
+              <section className="panel full-panel">
+                <PanelTitle
+                  title="Medication list"
+                  caption="A shared record, entered by your family"
+                  action={canWrite ? "Add medication" : undefined}
+                  onAction={() => openMedication()}
+                />
+                {medicationRows.length ? (
+                  <div className="medication-list">
+                    {medicationRows.map(med => (
+                      <article className="med-row" key={med.id}>
+                        <div className="med-icon">
+                          <Pill size={18} />
+                        </div>
+                        <div className="med-main">
+                          <div className="med-title-line">
+                            <h3>{med.name}</h3>
+                            <span
+                              className={`confirmation-pill ${med.today ? (med.today.status === "confirmed" ? "confirmed" : "follow-up") : "pending"}`}
+                            >
+                              {med.today
+                                ? med.today.status === "confirmed"
+                                  ? "Confirmation recorded today"
+                                  : "Follow-up note recorded"
+                                : "No confirmation recorded today"}
+                            </span>
+                          </div>
+                          <p className="med-dose">
+                            {med.dose} <span>·</span> {med.schedule}
+                          </p>
+                          {med.assigneeName && (
+                            <small>Point person: {med.assigneeName}</small>
+                          )}
+                          {med.startDate && (
+                            <small>
+                              Started {shortDate(`${med.startDate}T12:00:00`)}
+                              {med.endDate
+                                ? ` · Ends ${shortDate(`${med.endDate}T12:00:00`)}`
+                                : ""}
+                            </small>
+                          )}
+                          {med.notes && <p className="med-note">{med.notes}</p>}
+                          {med.today && (
+                            <p className="confirmation-meta">
+                              Recorded by{" "}
+                              {med.today.confirmerName || "a family member"} ·{" "}
+                              {dateTime(med.today.confirmedAt)}
+                              {med.today.note ? ` · ${med.today.note}` : ""}
+                            </p>
+                          )}
+                        </div>
+                        <div className="med-actions">
+                          {canWrite && !med.today && (
+                            <button
+                              className="button button-subtle small-button"
+                              onClick={() =>
+                                setDialog({
+                                  kind: "dose",
+                                  medicationId: med.id,
+                                  medicationName: med.name,
+                                })
+                              }
+                            >
+                              Record today
+                            </button>
+                          )}
+                          {canWrite && (
+                            <button
+                              className="icon-button"
+                              aria-label={`Edit ${med.name}`}
+                              onClick={() => openMedication(med)}
+                            >
+                              <span className="edit-word">Edit</span>
+                              <ChevronDown className="edit-chevron" size={15} />
+                            </button>
+                          )}
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                ) : (
+                  <EmptyState
+                    icon={Pill}
+                    title="No medication listed"
+                    body="Add a medication name, the prescribed dose and your family’s reminder schedule."
+                    action={
+                      canWrite && (
+                        <button
+                          className="button button-primary"
+                          onClick={() => openMedication()}
+                        >
+                          <Plus size={16} />
+                          Add medication
+                        </button>
+                      )
+                    }
+                  />
+                )}
+                <p className="form-hint calendar-hint">
+                  A confirmation records who entered it and when. It is not
+                  medical verification and does not change any dose or schedule.
+                </p>
+              </section>
+            </>
+          )}
+
+          {activeTab === "journal" && (
+            <section className="panel full-panel">
+              <PanelTitle
+                title="The care journal"
+                caption="A clear handoff between family members"
+                action={canWrite ? "Add an update" : undefined}
+                onAction={() => setDialog({ kind: "note" })}
+              />
+              {noteRows.length ? (
+                <div className="journal-timeline">
+                  {noteRows.map(note => (
+                    <JournalEntry key={note.id} note={note} />
+                  ))}
+                </div>
+              ) : (
+                <EmptyState
+                  icon={Activity}
+                  title="Start with a small update"
+                  body="Capture a visit note, a question to ask, or what the next caregiver should know."
+                  action={
+                    canWrite && (
+                      <button
+                        className="button button-primary"
+                        onClick={() => setDialog({ kind: "note" })}
+                      >
+                        <Plus size={16} />
+                        Add an update
+                      </button>
+                    )
+                  }
+                />
+              )}
+              <p className="form-hint calendar-hint">
+                Entries are family notes, not diagnoses or medical advice. Mark
+                an entry as a confirmed fact only when you know it is confirmed.
+              </p>
+            </section>
+          )}
+
+          {activeTab === "family" && (
+            <div className="family-columns">
+              <section className="panel full-panel">
+                <PanelTitle
+                  title="People in your circle"
+                  caption={`${memberRows.length} ${memberRows.length === 1 ? "member" : "members"}`}
+                  action={canCoordinate ? "Invite someone" : undefined}
+                  onAction={() => setDialog({ kind: "invite" })}
+                />
+                <div className="member-list">
+                  {memberRows.map(member => (
+                    <article className="member-row" key={member.id}>
+                      <Avatar name={member.name} />
+                      <div className="member-main">
+                        <strong>{member.name || "Family member"}</strong>
+                        <small>
+                          {member.email || "Signed in family member"}
+                        </small>
+                      </div>
+                      {canCoordinate && member.role !== "owner" ? (
+                        <select
+                          className="role-select"
+                          value={member.role}
+                          aria-label={`Role for ${member.name || "member"}`}
+                          onChange={async event => {
+                            try {
+                              await changeRole.mutateAsync({
+                                familyId,
+                                memberId: member.id,
+                                role: event.target.value as
+                                  | "coordinator"
+                                  | "caregiver"
+                                  | "viewer",
+                              });
+                              await refresh();
+                              toast.success("Family role updated.");
+                            } catch (error) {
+                              showError(error);
+                            }
+                          }}
+                        >
+                          <option value="coordinator">Coordinator</option>
+                          <option value="caregiver">Caregiver</option>
+                          <option value="viewer">Viewer</option>
+                        </select>
+                      ) : (
+                        <span
+                          className={`role-pill ${member.role === "owner" ? "owner" : ""}`}
+                        >
+                          {member.role}
+                        </span>
+                      )}
+                      {canCoordinate && member.role !== "owner" && (
+                        <button
+                          className="text-danger"
+                          onClick={async () => {
+                            if (
+                              !window.confirm(
+                                `Remove ${member.name || "this member"} from ${currentFamily?.name}?`
+                              )
+                            )
+                              return;
+                            try {
+                              await removeMember.mutateAsync({
+                                familyId,
+                                memberId: member.id,
+                              });
+                              await refresh();
+                              toast.success("Member removed from this family.");
+                            } catch (error) {
+                              showError(error);
+                            }
+                          }}
+                        >
+                          Remove
+                        </button>
+                      )}
+                    </article>
+                  ))}
+                </div>
+                {canCoordinate && (
+                  <div className="invite-link-note">
+                    <ShieldCheck size={17} />
+                    <span>
+                      Invite links expire after 7 days and can be revoked here.
+                      Links are not emailed by this app.
+                    </span>
+                  </div>
+                )}
+              </section>
+              <div className="family-side">
+                <section className="panel family-info">
+                  <span className="soft-icon">
+                    <Heart size={19} />
+                  </span>
+                  <span className="eyebrow">YOUR FAMILY SPACE</span>
+                  <h3>{currentFamily?.name}</h3>
+                  <p>
+                    Your role is <strong>{currentFamily?.role}</strong>. Only
+                    members of this family can view its care information.
+                  </p>
+                  <button
+                    className="text-danger leave-button"
+                    onClick={async () => {
+                      if (
+                        !window.confirm(
+                          "Leave this family? You’ll lose access to its shared care information."
+                        )
+                      )
+                        return;
+                      try {
+                        await leaveFamily.mutateAsync({ familyId });
+                        setSelectedId(null);
+                        await utils.care.families.list.invalidate();
+                        toast.success("You left the family space.");
+                      } catch (error) {
+                        showError(error);
+                      }
+                    }}
+                  >
+                    Leave family space
+                  </button>
+                </section>
+                {canCoordinate && (
+                  <section className="panel invitations-panel">
+                    <PanelTitle
+                      title="Invitation links"
+                      caption="Pending and recent"
+                    />
+                    {invitations.data?.length ? (
+                      invitations.data.slice(0, 6).map(invite => (
+                        <div className="invitation-row" key={invite.id}>
+                          <div>
+                            <strong>{invite.email || "Link invitation"}</strong>
+                            <small>
+                              {invite.role} · {invite.status} · Expires{" "}
+                              {shortDate(invite.expiresAt)}
+                            </small>
+                          </div>
+                          {invite.status === "pending" && (
+                            <button
+                              className="text-danger"
+                              onClick={async () => {
+                                try {
+                                  await revokeInvitation.mutateAsync({
+                                    familyId,
+                                    invitationId: invite.id,
+                                  });
+                                  await refresh();
+                                  toast.success("Invitation revoked.");
+                                } catch (error) {
+                                  showError(error);
+                                }
+                              }}
+                            >
+                              Revoke
+                            </button>
+                          )}
+                        </div>
+                      ))
+                    ) : (
+                      <p className="empty-copy">No invitations created yet.</p>
+                    )}
+                  </section>
+                )}
+              </div>
+            </div>
+          )}
+
+          {activeTab === "privacy" && (
+            <section className="panel privacy-panel">
+              <div className="privacy-lead">
+                <span className="soft-icon">
+                  <ShieldCheck size={22} />
+                </span>
+                <span className="eyebrow">A NOTE ON TRUST</span>
+                <h2>Care is personal. Keep the circle small.</h2>
+                <p>
+                  Care Circle is built for family coordination—not clinical
+                  decision-making, emergency response or a medical record.
+                </p>
+              </div>
+              <div className="privacy-grid">
+                <article>
+                  <h3>
+                    <Users size={17} /> Family-only access
+                  </h3>
+                  <p>
+                    Family data is shown only to signed-in users with an active
+                    membership in that family. Family roles are checked by the
+                    server for each data request.
+                  </p>
+                </article>
+                <article>
+                  <h3>
+                    <ShieldCheck size={17} /> Use care with sensitive details
+                  </h3>
+                  <p>
+                    Share only what the family needs to coordinate. Do not enter
+                    payment details, passwords, highly sensitive medical records
+                    or information you do not have permission to share.
+                  </p>
+                </article>
+                <article>
+                  <h3>
+                    <Pill size={17} /> Not medical advice
+                  </h3>
+                  <p>
+                    Medication doses and schedules should come from the
+                    clinician. A family confirmation is only a record of what a
+                    member entered; the app cannot verify that a dose was given.
+                  </p>
+                </article>
+                <article>
+                  <h3>
+                    <CircleHelp size={17} /> No emergency service
+                  </h3>
+                  <p>
+                    This app does not monitor emergencies or guarantee that a
+                    family member will respond. For emergencies, contact local
+                    emergency services.
+                  </p>
+                </article>
+              </div>
+              <div className="privacy-actions">
+                <button
+                  className="button button-subtle"
+                  onClick={downloadFamilyExport}
+                  disabled={exportFamily.isPending}
+                >
+                  <Download size={16} />
+                  {exportFamily.isPending
+                    ? "Preparing export…"
+                    : "Download this family’s data"}
+                </button>
+                <p>
+                  Exports the selected family’s shared records to this device as
+                  JSON. No other family spaces are included.
+                </p>
+              </div>
+              <p className="privacy-implementation-note">
+                This is an in-product safety and privacy summary, not a legal
+                privacy policy. Automated email and external reminders are not
+                available in this stage. A self-service account deletion flow is
+                not available yet.
+              </p>
+            </section>
+          )}
+
+          {inviteLink && (
+            <div className="created-invite">
+              <div>
+                <strong>Invitation link ready</strong>
+                <small>Share it privately. No email was sent.</small>
+                <code>{inviteLink}</code>
+              </div>
+              <button
+                className="button button-subtle small-button"
+                onClick={async () => {
+                  try {
+                    await navigator.clipboard.writeText(inviteLink);
+                    toast.success("Link copied.");
+                  } catch {
+                    toast.error(
+                      "Clipboard access is unavailable; select and copy the link."
+                    );
+                  }
+                }}
+              >
+                Copy link
+              </button>
+              <button
+                className="icon-button"
+                onClick={() => setInviteLink("")}
+                aria-label="Dismiss invitation link"
+              >
+                <XCircle size={17} />
+              </button>
+            </div>
+          )}
+          <footer className="page-footer">
+            Care Circle helps families share everyday coordination. It is not a
+            substitute for professional medical care or emergency services.
+          </footer>
+        </div>
       </main>
+      <CareDialog
+        mode={dialog}
+        members={memberOptions}
+        busy={busy}
+        onClose={() => setDialog(null)}
+        onSubmit={submitDialog}
+      />
     </div>
+  );
+}
+
+function pageSubtitle(tab: Tab) {
+  const subtitles: Record<Tab, string> = {
+    home: "A steady place to see what’s next and who’s taking care of it.",
+    tasks: "Small, clear commitments help everyone know what comes next.",
+    calendar: "Keep appointments and visits visible to the whole family.",
+    medications:
+      "A shared family record of prescribed schedules and confirmations.",
+    journal: "Leave useful context for the next person stepping in.",
+    family: "The people who share access to this family space.",
+    privacy: "What this first-stage app does—and what it does not do.",
+  };
+  return subtitles[tab];
+}
+
+function Landing({ signIn, error }: { signIn: () => void; error: string }) {
+  return (
+    <div className="landing-screen">
+      <div className="landing-top">
+        <Brand />
+        <span className="landing-top-label">A calmer way to care together</span>
+      </div>
+      <main className="landing-main">
+        <div className="landing-copy">
+          <span className="eyebrow">
+            <span className="status-dot dot-sage" /> FAMILY CARE, IN ONE PLACE
+          </span>
+          <h1>
+            Care, shared
+            <br />
+            <em>clearly.</em>
+          </h1>
+          <p>
+            Bring the family’s tasks, appointments, medication check-ins and
+            care notes together—so everyone knows what’s next and who’s there.
+          </p>
+          <button
+            className="button button-primary landing-cta"
+            onClick={signIn}
+          >
+            Sign in to your family space <ArrowUpRight size={17} />
+          </button>
+          <small className="login-provider">
+            Secure sign-in with Manus. New here? Your account is created when
+            you sign in.
+          </small>
+          {error && <p className="inline-error">{error}</p>}
+        </div>
+        <div className="landing-preview">
+          <div className="preview-topline">
+            <span className="preview-dot" />
+            <span className="preview-dot" />
+            <span className="preview-dot" />
+            <span>EXAMPLE ONLY · PRODUCT PREVIEW</span>
+          </div>
+          <div className="preview-greeting">
+            <span>MONDAY, MAY 19</span>
+            <h2>A little more in sync.</h2>
+          </div>
+          <div className="preview-task">
+            <span className="preview-check">
+              <Check size={13} />
+            </span>
+            <span>
+              <strong>Pick up groceries</strong>
+              <small>Today · Jordan</small>
+            </span>
+            <span className="preview-tag">DONE</span>
+          </div>
+          <div className="preview-task">
+            <span className="preview-check empty" />
+            <span>
+              <strong>Dr. Patel · 2:30 PM</strong>
+              <small>Tomorrow · Sam is going</small>
+            </span>
+            <span className="preview-calendar">
+              <CalendarDays size={17} />
+            </span>
+          </div>
+          <div className="preview-note">
+            <span className="preview-avatar">M</span>
+            <p>
+              <strong>Mom seemed more rested after lunch.</strong>
+              <small>Maya · 10 minutes ago</small>
+            </p>
+          </div>
+          <div className="preview-bottom">
+            <span>
+              <span className="dot-small" /> Sample family members
+            </span>
+            <span>
+              One shared circle <Heart size={13} />
+            </span>
+          </div>
+        </div>
+      </main>
+      <div className="landing-values">
+        <div>
+          <span>01</span>
+          <p>
+            <strong>Know what’s next</strong>
+            <small>Tasks and appointments, in one place</small>
+          </p>
+        </div>
+        <div>
+          <span>02</span>
+          <p>
+            <strong>Share the small stuff</strong>
+            <small>Clear owners, fewer missed handoffs</small>
+          </p>
+        </div>
+        <div>
+          <span>03</span>
+          <p>
+            <strong>Keep the family close</strong>
+            <small>A private circle for care coordination</small>
+          </p>
+        </div>
+      </div>
+      <footer className="landing-footer">
+        <span>care circle</span>
+        <span>For coordination, not medical advice or emergency response.</span>
+      </footer>
+    </div>
+  );
+}
+
+function StatCard({
+  icon: Icon,
+  label,
+  value,
+  detail,
+  tone,
+  onClick,
+}: {
+  icon: LucideIcon;
+  label: string;
+  value: number;
+  detail: string;
+  tone: string;
+  onClick: () => void;
+}) {
+  return (
+    <button className="stat-card" onClick={onClick}>
+      <span className={`stat-icon ${tone}`}>
+        <Icon size={18} />
+      </span>
+      <span className="stat-label">{label}</span>
+      <strong className="stat-value">{value}</strong>
+      <span className="stat-detail">{detail}</span>
+    </button>
+  );
+}
+function PanelTitle({
+  title,
+  caption,
+  action,
+  onAction,
+}: {
+  title: string;
+  caption?: string;
+  action?: string;
+  onAction?: () => void;
+}) {
+  return (
+    <div className="panel-title">
+      <div>
+        <h2>{title}</h2>
+        {caption && <span>{caption}</span>}
+      </div>
+      {action && (
+        <button className="text-action" onClick={onAction}>
+          {action}
+          <ArrowUpRight size={14} />
+        </button>
+      )}
+    </div>
+  );
+}
+function TaskRow({
+  task,
+  isOverdue,
+  onEdit,
+  onComplete,
+  onDelete,
+  showDelete = false,
+  readOnly = false,
+}: {
+  task: {
+    id: number;
+    title: string;
+    description: string | null;
+    dueAt: Date | null;
+    priority: string;
+    assigneeId: number | null;
+    assigneeName: string | null;
+    status: string;
+    recurrence: string;
+    notes: string | null;
+    completedByName: string | null;
+    completedAt: Date | null;
+    completionHistory: Array<{
+      completedAt: Date;
+      completedByName: string | null;
+    }>;
+  };
+  isOverdue: boolean;
+  onEdit: () => void;
+  onComplete: () => void;
+  onDelete?: () => void;
+  showDelete?: boolean;
+  readOnly?: boolean;
+}) {
+  return (
+    <article
+      className={`task-row ${task.status === "completed" ? "task-complete" : ""}`}
+    >
+      <button
+        className={`task-check ${task.status === "completed" ? "checked" : ""}`}
+        aria-label={
+          task.status === "completed" ? "Reopen task" : "Mark task complete"
+        }
+        onClick={onComplete}
+        disabled={readOnly}
+      >
+        {task.status === "completed" && <Check size={13} />}
+      </button>
+      <button className="task-copy" onClick={onEdit} disabled={readOnly}>
+        <strong>{task.title}</strong>
+        {task.description && <small>{task.description}</small>}
+        <span className="task-metadata">
+          <span className={isOverdue ? "meta-overdue" : ""}>
+            {isOverdue ? "Past due · " : ""}
+            {shortDate(task.dueAt)}
+          </span>
+          <span className="meta-separator">·</span>
+          <span>{task.assigneeName || "Unassigned"}</span>
+          {task.recurrence !== "none" && (
+            <span className="repeat-tag">Repeats {task.recurrence}</span>
+          )}
+          {task.status === "in_progress" && (
+            <span className="in-progress-tag">In progress</span>
+          )}
+        </span>
+      </button>
+      <span className={`priority-pill priority-${task.priority}`}>
+        {task.priority}
+      </span>
+      {showDelete && onDelete && (
+        <button className="text-danger task-delete" onClick={onDelete}>
+          Delete
+        </button>
+      )}
+      {task.completionHistory.length > 0 ? (
+        <details className="completion-history">
+          <summary>
+            Completion history ({task.completionHistory.length})
+          </summary>
+          <ul>
+            {task.completionHistory.map((completion, index) => (
+              <li key={`${completion.completedAt.toISOString()}-${index}`}>
+                {completion.completedByName || "A family member"} ·{" "}
+                {dateTime(completion.completedAt)}
+              </li>
+            ))}
+          </ul>
+        </details>
+      ) : task.completedAt ? (
+        <span className="completion-meta">
+          {task.status === "completed" ? "Completed" : "Last completed"} by{" "}
+          {task.completedByName || "a family member"} ·{" "}
+          {dateTime(task.completedAt)}
+        </span>
+      ) : null}
+    </article>
+  );
+}
+function JournalEntry({
+  note,
+  compact = false,
+}: {
+  note: {
+    id: number;
+    kind: string;
+    body: string;
+    isConfirmedFact: boolean;
+    createdAt: Date;
+    authorName: string | null;
+  };
+  compact?: boolean;
+}) {
+  const labels: Record<string, string> = {
+    update: "CARE UPDATE",
+    visit_note: "VISIT NOTE",
+    question: "QUESTION FOR THE CLINICIAN",
+    handoff: "CARE HANDOFF",
+    need: "FAMILY NEED",
+  };
+  return (
+    <article
+      className={`journal-entry ${compact ? "journal-entry-compact" : ""}`}
+    >
+      <span className="journal-marker" />
+      <div className="journal-entry-content">
+        <div className="journal-meta">
+          <span>{labels[note.kind] || "CARE UPDATE"}</span>
+          {note.isConfirmedFact && (
+            <span className="fact-mark">
+              <CheckCircle2 size={12} /> CONFIRMED FACT
+            </span>
+          )}
+        </div>
+        <p>{note.body}</p>
+        <div className="journal-author">
+          <Avatar name={note.authorName} />
+          <span>{note.authorName || "Family member"}</span>
+          <span>·</span>
+          <time>{dateTime(note.createdAt)}</time>
+        </div>
+      </div>
+    </article>
   );
 }

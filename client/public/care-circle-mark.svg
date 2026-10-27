@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Care Circle mark">
+  <rect width="64" height="64" rx="18" fill="#eef4ee"/>
+  <path d="M29 17a15 15 0 1 0 0 30" fill="none" stroke="#28564b" stroke-width="4" stroke-linecap="round"/>
+  <path d="M35 17a15 15 0 1 1 0 30" fill="none" stroke="#28564b" stroke-width="4" stroke-linecap="round"/>
+  <circle cx="27" cy="31" r="3.5" fill="#d48d6c"/>
+  <circle cx="37" cy="33" r="3.5" fill="#28564b"/>
+</svg>

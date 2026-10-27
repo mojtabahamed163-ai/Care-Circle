@@ -1,4 +1,8 @@
-import { OAUTH_STATE_COOKIE, encodeOAuthState } from "@shared/const";
+import {
+  OAUTH_STATE_COOKIE,
+  OAUTH_STATE_COOKIE_LOCAL,
+  encodeOAuthState,
+} from "@shared/const";
 
 export { COOKIE_NAME, ONE_YEAR_MS } from "@shared/const";
 
@@ -15,12 +19,20 @@ export { COOKIE_NAME, ONE_YEAR_MS } from "@shared/const";
 export const startLogin = () => {
   const oauthPortalUrl = window.__MANUS_CONFIG__?.oauthPortalUrl;
   const appId = window.__MANUS_CONFIG__?.projectId;
-  if (!oauthPortalUrl || !appId) throw new Error("Manus login is not configured");
+  if (!oauthPortalUrl || !appId)
+    throw new Error("Manus login is not configured");
   const redirectUri = `${window.location.origin}/api/oauth/callback`;
 
   const nonce = crypto.randomUUID();
-  document.cookie = `${OAUTH_STATE_COOKIE}=${nonce}; Path=/; Max-Age=600; SameSite=None; Secure`;
-  const state = encodeOAuthState({ redirectUri, nonce });
+  const localHttp =
+    window.location.protocol === "http:" &&
+    ["localhost", "127.0.0.1", "::1", "[::1]"].includes(
+      window.location.hostname
+    );
+  const cookieName = localHttp ? OAUTH_STATE_COOKIE_LOCAL : OAUTH_STATE_COOKIE;
+  const cookieOptions = localHttp ? "SameSite=Lax" : "SameSite=None; Secure";
+  document.cookie = `${cookieName}=${nonce}; Path=/; Max-Age=600; ${cookieOptions}`;
+  const state = encodeOAuthState({ redirectUri, nonce, localHttp });
 
   const url = new URL(`${oauthPortalUrl}/app-auth`);
   url.searchParams.set("appId", appId);
