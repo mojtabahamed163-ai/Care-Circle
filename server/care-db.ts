@@ -12,7 +12,12 @@ import {
   or,
 } from "drizzle-orm";
 import { TRPCError } from "@trpc/server";
-import { nextRecurringDueDate } from "./care-utils";
+import {
+  dateKeyInZone,
+  isValidTimeZone,
+  resolveLocalDateTime,
+} from "../shared/timezone";
+import { nextRecurringDueDate, normalizeDoseTimes, storedDoseTimes } from "./care-utils";
 import {
   careEvents,
   careNotes,
@@ -591,6 +596,113 @@ export async function leaveFamily(userId: number, familyId: number) {
   return { success: true };
 }
 
+/** Remove the login/profile and memberships while retaining shared family history
+ * under a non-loginable, generic former-member record. Owners must transfer all
+ * family ownership before this destructive account operation is permitted.
+ */
+export async function deleteAccount(userId: number) {
+  const db = await getDb();
+  if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
+  return db.transaction(async tx => {
+    const [user] = await tx
+      .select({ id: users.id, openId: users.openId })
+      .from(users)
+      .where(eq(users.id, userId))
+      .limit(1)
+      .for("update");
+    if (!user) throw new TRPCError({ code: "NOT_FOUND" });
+    const memberships = await tx
+      .select({ familyId: familyMembers.familyId, role: familyMembers.role })
+      .from(familyMembers)
+      .where(eq(familyMembers.userId, userId))
+      .for("update");
+    if (memberships.some(member => member.role === "owner"))
+      throw new TRPCError({
+        code: "PRECONDITION_FAILED",
+        message:
+          "Transfer ownership of every family you own before deleting this account.",
+      });
+
+    const [tombstoneResult] = await tx.insert(users).values({
+      openId: `former-${randomBytes(24).toString("hex")}`,
+      name: "Former family member",
+      email: null,
+      loginMethod: null,
+      role: "user",
+    });
+    const formerMemberId = Number(
+      (tombstoneResult as { insertId?: number | bigint }).insertId
+    );
+    if (!formerMemberId)
+      throw new TRPCError({ code: "INTERNAL_SERVER_ERROR" });
+
+    await tx
+      .update(familyInvitations)
+      .set({ status: "revoked" })
+      .where(
+        and(
+          eq(familyInvitations.invitedBy, userId),
+          eq(familyInvitations.status, "pending")
+        )
+      );
+    await tx
+      .update(familyInvitations)
+      .set({ invitedBy: formerMemberId })
+      .where(eq(familyInvitations.invitedBy, userId));
+    await tx
+      .update(familyInvitations)
+      .set({ acceptedBy: formerMemberId })
+      .where(eq(familyInvitations.acceptedBy, userId));
+    await tx
+      .update(families)
+      .set({ createdBy: formerMemberId })
+      .where(eq(families.createdBy, userId));
+    await tx
+      .update(careTasks)
+      .set({ createdBy: formerMemberId })
+      .where(eq(careTasks.createdBy, userId));
+    await tx
+      .update(careTasks)
+      .set({ completedBy: formerMemberId })
+      .where(eq(careTasks.completedBy, userId));
+    await tx
+      .update(careTaskCompletions)
+      .set({ completedBy: formerMemberId })
+      .where(eq(careTaskCompletions.completedBy, userId));
+    await tx
+      .update(medications)
+      .set({ createdBy: formerMemberId })
+      .where(eq(medications.createdBy, userId));
+    await tx
+      .update(doseConfirmations)
+      .set({ confirmedBy: formerMemberId })
+      .where(eq(doseConfirmations.confirmedBy, userId));
+    await tx
+      .update(careEvents)
+      .set({ createdBy: formerMemberId })
+      .where(eq(careEvents.createdBy, userId));
+    await tx
+      .update(careNotes)
+      .set({ createdBy: formerMemberId })
+      .where(eq(careNotes.createdBy, userId));
+    await tx
+      .update(careTasks)
+      .set({ assigneeId: null })
+      .where(eq(careTasks.assigneeId, userId));
+    await tx
+      .update(medications)
+      .set({ assigneeId: null })
+      .where(eq(medications.assigneeId, userId));
+    await tx
+      .update(careEvents)
+      .set({ escortId: null })
+      .where(eq(careEvents.escortId, userId));
+    await tx.delete(familyMembers).where(eq(familyMembers.userId, userId));
+    await tx.delete(users).where(eq(users.id, userId));
+    return { success: true, sharedHistoryRetained: true } as const;
+  });
+}
+
 export async function listTasks(userId: number, familyId: number) {
   await requireMembership(userId, familyId);
   const db = await getDb();
@@ -830,11 +942,7 @@ export async function deleteTask(
   return { success: true };
 }
 
-export async function listMedications(
-  userId: number,
-  familyId: number,
-  doseDate: string
-) {
+export async function listMedications(userId: number, familyId: number) {
   await requireMembership(userId, familyId);
   const db = await getDb();
   if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
@@ -845,6 +953,8 @@ export async function listMedications(
       name: medications.name,
       dose: medications.dose,
       schedule: medications.schedule,
+      doseTimes: medications.doseTimes,
+      timeZone: medications.timeZone,
       startDate: medications.startDate,
       endDate: medications.endDate,
       notes: medications.notes,
@@ -855,20 +965,27 @@ export async function listMedications(
     })
     .from(medications)
     .leftJoin(users, eq(medications.assigneeId, users.id))
-    .where(
-      and(
-        eq(medications.familyId, familyId),
-        eq(medications.active, true),
-        or(isNull(medications.startDate), lte(medications.startDate, doseDate)),
-        or(isNull(medications.endDate), gte(medications.endDate, doseDate))
-      )
-    )
+    .where(and(eq(medications.familyId, familyId), eq(medications.active, true)))
     .orderBy(asc(medications.name))
     .limit(100);
-  if (!rows.length) return [];
+  const now = new Date();
+  const activeRows = rows
+    .map(row => {
+      const timeZone = isValidTimeZone(row.timeZone) ? row.timeZone : "UTC";
+      return { ...row, timeZone, doseDate: dateKeyInZone(now, timeZone) };
+    })
+    .filter(
+      row =>
+        (!row.startDate || row.startDate <= row.doseDate) &&
+        (!row.endDate || row.endDate >= row.doseDate)
+    );
+  if (!activeRows.length) return [];
+  const doseDates = [...new Set(activeRows.map(row => row.doseDate))];
   const logs = await db
     .select({
       medicationId: doseConfirmations.medicationId,
+      doseDate: doseConfirmations.doseDate,
+      doseTime: doseConfirmations.doseTime,
       status: doseConfirmations.status,
       confirmedAt: doseConfirmations.confirmedAt,
       confirmedBy: doseConfirmations.confirmedBy,
@@ -880,15 +997,30 @@ export async function listMedications(
     .where(
       and(
         eq(doseConfirmations.familyId, familyId),
-        eq(doseConfirmations.doseDate, doseDate),
+        inArray(
+          doseConfirmations.doseDate,
+          doseDates
+        ),
         inArray(
           doseConfirmations.medicationId,
-          rows.map(row => row.id)
+          activeRows.map(row => row.id)
         )
       )
     );
-  const logMap = new Map(logs.map(log => [log.medicationId, log]));
-  return rows.map(row => ({ ...row, today: logMap.get(row.id) ?? null }));
+  const logMap = new Map(
+    logs.map(log => [
+      `${log.medicationId}:${log.doseDate}:${log.doseTime}`,
+      log,
+    ])
+  );
+  return activeRows.map(row => ({
+    ...row,
+    doses: storedDoseTimes(row.doseTimes).map(doseTime => ({
+      time: doseTime,
+      confirmation:
+        logMap.get(`${row.id}:${row.doseDate}:${doseTime}`) ?? null,
+    })),
+  }));
 }
 
 export async function createMedication(
@@ -898,6 +1030,8 @@ export async function createMedication(
     name: string;
     dose: string;
     schedule: string;
+    doseTimes: string;
+    timeZone: string;
     startDate?: string | null;
     endDate?: string | null;
     notes?: string | null;
@@ -907,10 +1041,14 @@ export async function createMedication(
   const role = await requireMembership(userId, familyId);
   requireWrite(role);
   await requireAssigneeInFamily(input.assigneeId, familyId);
+  const doseTimes = normalizeDoseTimes(input.doseTimes);
+  if (!isValidTimeZone(input.timeZone))
+    throw new TRPCError({ code: "BAD_REQUEST", message: "Choose a valid IANA time zone." });
   const db = await getDb();
   if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
   await db.insert(medications).values({
     ...input,
+    doseTimes: doseTimes.join(","),
     name: input.name.trim(),
     dose: input.dose.trim(),
     schedule: input.schedule.trim(),
@@ -929,6 +1067,8 @@ export async function updateMedication(
     name: string;
     dose: string;
     schedule: string;
+    doseTimes: string;
+    timeZone: string;
     startDate?: string | null;
     endDate?: string | null;
     notes?: string | null;
@@ -959,10 +1099,14 @@ export async function updateMedication(
   )
     throw new TRPCError({ code: "FORBIDDEN" });
   await requireAssigneeInFamily(input.assigneeId, familyId);
+  const doseTimes = normalizeDoseTimes(input.doseTimes);
+  if (!isValidTimeZone(input.timeZone))
+    throw new TRPCError({ code: "BAD_REQUEST", message: "Choose a valid IANA time zone." });
   await db
     .update(medications)
     .set({
       ...input,
+      doseTimes: doseTimes.join(","),
       name: input.name.trim(),
       dose: input.dose.trim(),
       schedule: input.schedule.trim(),
@@ -978,6 +1122,7 @@ export async function confirmDose(
   familyId: number,
   medicationId: number,
   doseDate: string,
+  doseTime: string,
   note?: string | null
 ) {
   const role = await requireMembership(userId, familyId);
@@ -986,7 +1131,14 @@ export async function confirmDose(
   if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
   return db.transaction(async tx => {
     const [medication] = await tx
-      .select({ id: medications.id, active: medications.active })
+      .select({
+        id: medications.id,
+        active: medications.active,
+        doseTimes: medications.doseTimes,
+        timeZone: medications.timeZone,
+        startDate: medications.startDate,
+        endDate: medications.endDate,
+      })
       .from(medications)
       .where(
         and(
@@ -997,29 +1149,42 @@ export async function confirmDose(
       .limit(1)
       .for("update");
     if (!medication || !medication.active)
-      throw new TRPCError({
-        code: "NOT_FOUND",
-        message: "This medication is no longer active.",
-      });
+      throw new TRPCError({ code: "NOT_FOUND", message: "This medication is no longer active." });
+    const timeZone = isValidTimeZone(medication.timeZone)
+      ? medication.timeZone
+      : "UTC";
+    const today = dateKeyInZone(new Date(), timeZone);
+    if (doseDate !== today)
+      throw new TRPCError({ code: "BAD_REQUEST", message: "Confirmations are recorded for the medication's current local date only." });
+    if (
+      (medication.startDate && today < medication.startDate) ||
+      (medication.endDate && today > medication.endDate)
+    )
+      throw new TRPCError({ code: "BAD_REQUEST", message: "This medication is outside its active date range." });
+    if (!storedDoseTimes(medication.doseTimes).includes(doseTime))
+      throw new TRPCError({ code: "BAD_REQUEST", message: "Choose a scheduled dose time." });
     const [existing] = await tx
       .select({ id: doseConfirmations.id })
       .from(doseConfirmations)
       .where(
         and(
+          eq(doseConfirmations.familyId, familyId),
           eq(doseConfirmations.medicationId, medicationId),
-          eq(doseConfirmations.doseDate, doseDate)
+          eq(doseConfirmations.doseDate, doseDate),
+          eq(doseConfirmations.doseTime, doseTime)
         )
       )
       .limit(1);
     if (existing)
       throw new TRPCError({
         code: "CONFLICT",
-        message: "A confirmation is already recorded for this date.",
+        message: "This dose already has a confirmation for this local date.",
       });
     await tx.insert(doseConfirmations).values({
       familyId,
       medicationId,
       doseDate,
+      doseTime,
       status: note?.trim() ? "needs_follow_up" : "confirmed",
       note: note?.trim() || null,
       confirmedBy: userId,
@@ -1039,6 +1204,7 @@ export async function listEvents(userId: number, familyId: number) {
       title: careEvents.title,
       kind: careEvents.kind,
       startsAt: careEvents.startsAt,
+      timeZone: careEvents.timeZone,
       location: careEvents.location,
       escortId: careEvents.escortId,
       escortName: users.name,
@@ -1060,7 +1226,8 @@ export async function createEvent(
   input: {
     title: string;
     kind: "appointment" | "visit";
-    startsAt: Date;
+    startsAtLocal: string;
+    timeZone: string;
     location?: string | null;
     escortId?: number | null;
     reminderMinutes: number;
@@ -1071,15 +1238,103 @@ export async function createEvent(
   const role = await requireMembership(userId, familyId);
   requireWrite(role);
   await requireAssigneeInFamily(input.escortId, familyId);
+  const resolved = resolveLocalDateTime(input.startsAtLocal, input.timeZone);
+  if (!resolved.ok)
+    throw new TRPCError({
+      code: "BAD_REQUEST",
+      message: `Invalid appointment time: ${resolved.reason}.`,
+    });
   const db = await getDb();
   if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
+  const { startsAtLocal: _local, ...eventFields } = input;
   await db.insert(careEvents).values({
-    ...input,
+    ...eventFields,
+    startsAt: resolved.instant,
     familyId,
     createdBy: userId,
     title: input.title.trim(),
   });
   return { success: true };
+}
+
+export async function updateEvent(
+  userId: number,
+  familyId: number,
+  eventId: number,
+  input: {
+    title: string;
+    kind: "appointment" | "visit";
+    startsAtLocal: string;
+    timeZone: string;
+    location?: string | null;
+    escortId?: number | null;
+    reminderMinutes: number;
+    questions?: string | null;
+    visitNotes?: string | null;
+  }
+) {
+  const role = await requireMembership(userId, familyId);
+  requireWrite(role);
+  await requireAssigneeInFamily(input.escortId, familyId);
+  const resolved = resolveLocalDateTime(input.startsAtLocal, input.timeZone);
+  if (!resolved.ok)
+    throw new TRPCError({
+      code: "BAD_REQUEST",
+      message: `Invalid appointment time: ${resolved.reason}.`,
+    });
+  const db = await getDb();
+  if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
+  return db.transaction(async tx => {
+    const [event] = await tx
+      .select({ id: careEvents.id, createdBy: careEvents.createdBy })
+      .from(careEvents)
+      .where(
+        and(eq(careEvents.id, eventId), eq(careEvents.familyId, familyId))
+      )
+      .limit(1)
+      .for("update");
+    if (!event) throw new TRPCError({ code: "NOT_FOUND" });
+    if (!managers.includes(role) && event.createdBy !== userId)
+      throw new TRPCError({ code: "FORBIDDEN" });
+    const { startsAtLocal: _local, ...fields } = input;
+    await tx
+      .update(careEvents)
+      .set({ ...fields, startsAt: resolved.instant, title: input.title.trim() })
+      .where(
+        and(eq(careEvents.id, eventId), eq(careEvents.familyId, familyId))
+      );
+    return { success: true };
+  });
+}
+
+export async function deleteEvent(
+  userId: number,
+  familyId: number,
+  eventId: number
+) {
+  const role = await requireMembership(userId, familyId);
+  requireWrite(role);
+  const db = await getDb();
+  if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
+  return db.transaction(async tx => {
+    const [event] = await tx
+      .select({ id: careEvents.id, createdBy: careEvents.createdBy })
+      .from(careEvents)
+      .where(
+        and(eq(careEvents.id, eventId), eq(careEvents.familyId, familyId))
+      )
+      .limit(1)
+      .for("update");
+    if (!event) throw new TRPCError({ code: "NOT_FOUND" });
+    if (!managers.includes(role) && event.createdBy !== userId)
+      throw new TRPCError({ code: "FORBIDDEN" });
+    await tx
+      .delete(careEvents)
+      .where(
+        and(eq(careEvents.id, eventId), eq(careEvents.familyId, familyId))
+      );
+    return { success: true };
+  });
 }
 
 export async function listCareNotes(userId: number, familyId: number) {

@@ -1,9 +1,11 @@
 import { TRPCError } from "@trpc/server";
 import { z } from "zod";
 import { COOKIE_NAME } from "@shared/const";
+import { isValidTimeZone } from "../shared/timezone";
 import { getSessionCookieOptions } from "./_core/cookies";
 import { systemRouter } from "./_core/systemRouter";
 import { protectedProcedure, publicProcedure, router } from "./_core/trpc";
+import { isDoseTimesValid } from "./care-utils";
 import * as care from "./care-db";
 
 const familyId = z.number().int().positive();
@@ -29,6 +31,12 @@ const medicationFields = {
   name: z.string().trim().min(1).max(180),
   dose: z.string().trim().min(1).max(180),
   schedule: z.string().trim().min(1).max(240),
+  doseTimes: z.string().max(240).refine(isDoseTimesValid, {
+    message: "Use up to 12 distinct HH:MM 24-hour times separated by commas.",
+  }),
+  timeZone: z.string().min(1).max(64).refine(isValidTimeZone, {
+    message: "Choose a valid IANA time zone.",
+  }),
   startDate: isoDate.nullable().optional(),
   endDate: isoDate.nullable().optional(),
   notes: z.string().max(5000).nullable().optional(),
@@ -43,6 +51,14 @@ export const appRouter = router({
       const cookieOptions = getSessionCookieOptions(ctx.req);
       ctx.res.clearCookie(COOKIE_NAME, { ...cookieOptions, maxAge: -1 });
       return { success: true } as const;
+    }),
+    deleteAccount: protectedProcedure.mutation(async ({ ctx }) => {
+      const result = await care.deleteAccount(ctx.user.id);
+      ctx.res.clearCookie(COOKIE_NAME, {
+        ...getSessionCookieOptions(ctx.req),
+        maxAge: -1,
+      });
+      return result;
     }),
   }),
   care: router({
@@ -180,15 +196,8 @@ export const appRouter = router({
     }),
     medications: router({
       list: protectedProcedure
-        .input(
-          z.object({
-            familyId,
-            doseDate: isoDate,
-          })
-        )
-        .query(({ ctx, input }) =>
-          care.listMedications(ctx.user.id, input.familyId, input.doseDate)
-        ),
+        .input(z.object({ familyId }))
+        .query(({ ctx, input }) => care.listMedications(ctx.user.id, input.familyId)),
       create: protectedProcedure
         .input(
           z
@@ -219,6 +228,7 @@ export const appRouter = router({
             familyId,
             medicationId: z.number().int().positive(),
             doseDate: isoDate,
+            doseTime: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$|^once$/),
             note: z.string().max(2000).nullable().optional(),
           })
         )
@@ -228,6 +238,7 @@ export const appRouter = router({
             input.familyId,
             input.medicationId,
             input.doseDate,
+            input.doseTime,
             input.note
           )
         ),
@@ -244,7 +255,10 @@ export const appRouter = router({
             familyId,
             title: z.string().trim().min(1).max(180),
             kind: z.enum(["appointment", "visit"]),
-            startsAt: z.date(),
+            startsAtLocal: z.string().min(16).max(16),
+            timeZone: z.string().min(1).max(64).refine(isValidTimeZone, {
+              message: "Choose a valid IANA time zone.",
+            }),
             location: z.string().max(240).nullable().optional(),
             escortId: z.number().int().positive().nullable().optional(),
             reminderMinutes: z.number().int().min(0).max(10080),
@@ -254,6 +268,33 @@ export const appRouter = router({
         )
         .mutation(({ ctx, input }) =>
           care.createEvent(ctx.user.id, input.familyId, input)
+        ),
+      update: protectedProcedure
+        .input(
+          z.object({
+            familyId,
+            eventId: z.number().int().positive(),
+            title: z.string().trim().min(1).max(180),
+            kind: z.enum(["appointment", "visit"]),
+            startsAtLocal: z.string().min(16).max(16),
+            timeZone: z.string().min(1).max(64).refine(isValidTimeZone, {
+              message: "Choose a valid IANA time zone.",
+            }),
+            location: z.string().max(240).nullable().optional(),
+            escortId: z.number().int().positive().nullable().optional(),
+            reminderMinutes: z.number().int().min(0).max(10080),
+            questions: z.string().max(5000).nullable().optional(),
+            visitNotes: z.string().max(5000).nullable().optional(),
+          })
+        )
+        .mutation(({ ctx, input }) => {
+          const { familyId: id, eventId, ...fields } = input;
+          return care.updateEvent(ctx.user.id, id, eventId, fields);
+        }),
+      delete: protectedProcedure
+        .input(z.object({ familyId, eventId: z.number().int().positive() }))
+        .mutation(({ ctx, input }) =>
+          care.deleteEvent(ctx.user.id, input.familyId, input.eventId)
         ),
     }),
     notes: router({

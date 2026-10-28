@@ -351,6 +351,14 @@
   background: #f5f8f4;
   border-color: #d2ddd2;
 }
+.button-danger {
+  color: #fff;
+  background: #9c4f43;
+  box-shadow: 0 3px 8px #9c4f4320;
+}
+.button-danger:hover:not(:disabled) {
+  background: #813f35;
+}
 .add-button {
   white-space: nowrap;
   min-height: 38px;
@@ -926,6 +934,13 @@
   font-size: 8px;
   display: inline-flex;
 }
+.event-actions {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+  flex-shrink: 0;
+}
 .escort-label {
   color: #557562 !important;
 }
@@ -1041,6 +1056,38 @@
   margin: 8px 0 0;
   font-size: 9px;
   line-height: 1.5;
+}
+.dose-list {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  margin-top: 12px;
+}
+.dose-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border: 1px solid #edf0eb;
+  border-radius: 10px;
+  padding: 9px 10px;
+  background: #fbfcfa;
+}
+.dose-row-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  color: #66746b;
+  font-size: 10px;
+}
+.dose-row-copy strong {
+  color: #435249;
+  font-size: 11px;
+}
+.dose-confirmation-meta {
+  color: #718077;
+  overflow-wrap: anywhere;
 }
 .med-actions {
   align-items: center;
@@ -1287,6 +1334,31 @@
   margin: 0;
   font-size: 10px;
   line-height: 1.65;
+}
+.account-deletion {
+  border: 1px solid #ead8d2;
+  border-radius: 10px;
+  background: #fdf9f7;
+  margin: 20px 0;
+  padding: 17px;
+}
+.account-deletion h3 {
+  color: #74453f;
+  margin: 0 0 8px;
+  font-size: 13px;
+}
+.account-deletion p,
+.account-deletion small {
+  color: #84736d;
+  display: block;
+  font-size: 10px;
+  line-height: 1.65;
+}
+.account-deletion p {
+  margin: 0 0 12px;
+}
+.account-deletion small {
+  margin-top: 9px;
 }
 .privacy-implementation-note {
   color: #8a7659;
@@ -2035,6 +2107,16 @@
   }
   .event-row {
     gap: 11px;
+  }
+  .event-actions {
+    gap: 4px;
+  }
+  .dose-row {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+  .dose-row .small-button {
+    align-self: flex-start;
   }
   .reminder-pill {
     display: none;

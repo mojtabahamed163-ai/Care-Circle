@@ -161,6 +161,8 @@ export const medications = mysqlTable(
     name: varchar("name", { length: 180 }).notNull(),
     dose: varchar("dose", { length: 180 }).notNull(),
     schedule: varchar("schedule", { length: 240 }).notNull(),
+    doseTimes: varchar("doseTimes", { length: 240 }).notNull().default(""),
+    timeZone: varchar("timeZone", { length: 64 }).notNull().default("UTC"),
     startDate: varchar("startDate", { length: 10 }),
     endDate: varchar("endDate", { length: 10 }),
     notes: text("notes"),
@@ -191,6 +193,7 @@ export const doseConfirmations = mysqlTable(
       .notNull()
       .references(() => medications.id),
     doseDate: varchar("doseDate", { length: 10 }).notNull(),
+    doseTime: varchar("doseTime", { length: 5 }).notNull().default("once"),
     status: mysqlEnum("status", ["confirmed", "needs_follow_up"])
       .default("confirmed")
       .notNull(),
@@ -201,9 +204,10 @@ export const doseConfirmations = mysqlTable(
     confirmedAt: timestamp("confirmedAt").defaultNow().notNull(),
   },
   table => ({
-    oneConfirmation: uniqueIndex("doseConfirmations_med_date_uq").on(
+    oneConfirmation: uniqueIndex("doseConfirmations_med_date_time_uq").on(
       table.medicationId,
-      table.doseDate
+      table.doseDate,
+      table.doseTime
     ),
     familyDate: index("doseConfirmations_family_date_idx").on(
       table.familyId,
@@ -224,6 +228,7 @@ export const careEvents = mysqlTable(
       .default("appointment")
       .notNull(),
     startsAt: timestamp("startsAt").notNull(),
+    timeZone: varchar("timeZone", { length: 64 }),
     location: varchar("location", { length: 240 }),
     escortId: int("escortId").references(() => users.id),
     reminderMinutes: int("reminderMinutes").default(60).notNull(),

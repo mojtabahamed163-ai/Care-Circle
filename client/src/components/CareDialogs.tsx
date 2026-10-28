@@ -1,4 +1,5 @@
 import { X } from "lucide-react";
+import { formatLocalDateTimeInZone, isValidTimeZone } from "@shared/timezone";
 
 export type FamilyMemberOption = {
   userId: number;
@@ -21,19 +22,34 @@ export type MedicationFormItem = {
   name: string;
   dose: string;
   schedule: string;
+  doseTimes: string;
+  timeZone: string;
   startDate: string | null;
   endDate: string | null;
   notes: string | null;
   assigneeId: number | null;
   active: boolean;
 };
+export type EventFormItem = {
+  id: number;
+  title: string;
+  kind: "appointment" | "visit";
+  startsAt: Date | string;
+  timeZone: string | null;
+  location: string | null;
+  escortId: number | null;
+  reminderMinutes: number;
+  questions: string | null;
+  visitNotes: string | null;
+  createdBy: number;
+};
 export type CareDialogMode =
   | { kind: "task"; item?: TaskFormItem }
   | { kind: "medication"; item?: MedicationFormItem }
-  | { kind: "event" }
+  | { kind: "event"; item?: EventFormItem }
   | { kind: "note" }
   | { kind: "invite" }
-  | { kind: "dose"; medicationId: number; medicationName: string };
+  | { kind: "dose"; medicationId: number; medicationName: string; doseTime: string };
 
 type Props = {
   mode: CareDialogMode | null;
@@ -50,6 +66,28 @@ function localDateTime(date?: Date | null) {
   if (!date) return "";
   const offset = date.getTimezoneOffset() * 60000;
   return new Date(date.getTime() - offset).toISOString().slice(0, 16);
+}
+
+function localDateTimeForZone(date: Date | string, timeZone: string) {
+  const parsed = new Date(date);
+  return Number.isNaN(parsed.getTime())
+    ? ""
+    : formatLocalDateTimeInZone(parsed, isValidTimeZone(timeZone) ? timeZone : "UTC");
+}
+
+const usTimeZones = [
+  "America/New_York",
+  "America/Chicago",
+  "America/Denver",
+  "America/Phoenix",
+  "America/Los_Angeles",
+  "America/Anchorage",
+  "Pacific/Honolulu",
+];
+
+function browserTimeZone() {
+  const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  return isValidTimeZone(zone) ? zone : "America/New_York";
 }
 
 function Field({
@@ -108,7 +146,9 @@ export default function CareDialog({
           ? "Update medication"
           : "Add medication"
         : mode.kind === "event"
-          ? "Add an appointment or visit"
+          ? mode.item
+            ? "Update appointment or visit"
+            : "Add an appointment or visit"
           : mode.kind === "note"
             ? "Add to the care journal"
             : mode.kind === "invite"
@@ -274,6 +314,30 @@ export default function CareDialog({
                   defaultValue={mode.item?.schedule ?? ""}
                 />
               </Field>
+              <Field label="Daily dose times (24-hour clock)">
+                <input
+                  required
+                  name="doseTimes"
+                  maxLength={240}
+                  placeholder="08:00, 20:00"
+                  defaultValue={mode.item?.doseTimes || "08:00"}
+                  pattern="^([01][0-9]|2[0-3]):[0-5][0-9](,\s*([01][0-9]|2[0-3]):[0-5][0-9])*$"
+                  title="Use distinct times like 08:00, 20:00."
+                />
+              </Field>
+              <Field label="Medication time zone (IANA)">
+                <input
+                  required
+                  name="timeZone"
+                  maxLength={64}
+                  list="care-circle-us-time-zones"
+                  defaultValue={mode.item?.timeZone || browserTimeZone()}
+                  placeholder="America/New_York"
+                />
+                <datalist id="care-circle-us-time-zones">
+                  {usTimeZones.map(zone => <option key={zone} value={zone} />)}
+                </datalist>
+              </Field>
               <div className="form-row">
                 <Field label="Start date">
                   <input
@@ -324,29 +388,49 @@ export default function CareDialog({
                   name="title"
                   maxLength={180}
                   placeholder="e.g. Dr. Patel — follow-up"
+                  defaultValue={mode.item?.title ?? ""}
                 />
               </Field>
               <div className="form-row">
                 <Field label="Type">
-                  <select name="kind" defaultValue="appointment">
+                  <select name="kind" defaultValue={mode.item?.kind ?? "appointment"}>
                     <option value="appointment">Medical appointment</option>
                     <option value="visit">Family visit</option>
                   </select>
                 </Field>
                 <Field label="Date & time">
-                  <input required name="startsAt" type="datetime-local" />
+                  <input
+                    required
+                    name="startsAtLocal"
+                    type="datetime-local"
+                    defaultValue={mode.item ? localDateTimeForZone(mode.item.startsAt, mode.item.timeZone || browserTimeZone()) : ""}
+                  />
                 </Field>
               </div>
+              <Field label="Appointment time zone (IANA)">
+                <input
+                  required
+                  name="timeZone"
+                  maxLength={64}
+                  list="care-circle-us-time-zones"
+                  defaultValue={mode.item?.timeZone || browserTimeZone()}
+                  placeholder="America/New_York"
+                />
+                <datalist id="care-circle-us-time-zones">
+                  {usTimeZones.map(zone => <option key={zone} value={zone} />)}
+                </datalist>
+              </Field>
               <Field label="Location">
                 <input
                   name="location"
                   maxLength={240}
                   placeholder="Clinic or home address"
+                  defaultValue={mode.item?.location ?? ""}
                 />
               </Field>
-              <MemberSelect members={members} label="Person accompanying" />
+              <MemberSelect members={members} initial={mode.item?.escortId} label="Person accompanying" />
               <Field label="Reminder preference">
-                <select name="reminderMinutes" defaultValue="60">
+                <select name="reminderMinutes" defaultValue={String(mode.item?.reminderMinutes ?? 60)}>
                   <option value="0">No reminder set</option>
                   <option value="15">15 minutes before</option>
                   <option value="30">30 minutes before</option>
@@ -360,6 +444,7 @@ export default function CareDialog({
                   rows={2}
                   maxLength={5000}
                   placeholder="Questions to bring to the visit"
+                  defaultValue={mode.item?.questions ?? ""}
                 />
               </Field>
               <Field label="Visit notes (optional)">
@@ -368,6 +453,7 @@ export default function CareDialog({
                   rows={2}
                   maxLength={5000}
                   placeholder="Add notes after the appointment"
+                  defaultValue={mode.item?.visitNotes ?? ""}
                 />
               </Field>
             </>

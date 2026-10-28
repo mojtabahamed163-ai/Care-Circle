@@ -133,6 +133,8 @@ function makeInitialState(): TableState {
         name: "Private medication",
         dose: "As prescribed",
         schedule: "Daily",
+        doseTimes: "",
+        timeZone: "UTC",
         startDate: null,
         endDate: null,
         notes: null,
@@ -151,6 +153,7 @@ function makeInitialState(): TableState {
         title: "Private appointment",
         kind: "appointment",
         startsAt: new Date("2026-10-29T12:00:00.000Z"),
+        timeZone: null,
         location: null,
         escortId: 2,
         reminderMinutes: 60,
@@ -633,11 +636,7 @@ describe("phase 1 HTTP integration with isolated in-memory MySQL-shaped test dou
       ],
       [
         "medication list",
-        () =>
-          caller.care.medications.list.query({
-            familyId: 20,
-            doseDate: "2026-10-28",
-          }),
+        () => caller.care.medications.list.query({ familyId: 20 }),
       ],
       [
         "medication create",
@@ -647,6 +646,8 @@ describe("phase 1 HTTP integration with isolated in-memory MySQL-shaped test dou
             name: "Injected",
             dose: "1",
             schedule: "daily",
+            doseTimes: "08:00,20:00",
+            timeZone: "America/New_York",
           }),
       ],
       [
@@ -658,6 +659,8 @@ describe("phase 1 HTTP integration with isolated in-memory MySQL-shaped test dou
             name: "Injected",
             dose: "1",
             schedule: "daily",
+            doseTimes: "08:00,20:00",
+            timeZone: "America/New_York",
             active: true,
           }),
       ],
@@ -668,9 +671,27 @@ describe("phase 1 HTTP integration with isolated in-memory MySQL-shaped test dou
             familyId: 20,
             medicationId: 220,
             doseDate: "2026-10-28",
+            doseTime: "once",
           }),
       ],
       ["event list", () => caller.care.events.list.query({ familyId: 20 })],
+      [
+        "event update",
+        () =>
+          caller.care.events.update.mutate({
+            familyId: 20,
+            eventId: 230,
+            title: "Injected event update",
+            kind: "appointment",
+            startsAtLocal: "2026-10-29T10:00",
+            timeZone: "America/New_York",
+            reminderMinutes: 0,
+          }),
+      ],
+      [
+        "event delete",
+        () => caller.care.events.delete.mutate({ familyId: 20, eventId: 230 }),
+      ],
       [
         "event create",
         () =>
@@ -678,7 +699,8 @@ describe("phase 1 HTTP integration with isolated in-memory MySQL-shaped test dou
             familyId: 20,
             title: "Injected",
             kind: "visit",
-            startsAt: fixedNow,
+            startsAtLocal: "2026-10-29T10:00",
+            timeZone: "America/New_York",
             reminderMinutes: 0,
           }),
       ],
@@ -746,6 +768,8 @@ describe("phase 1 HTTP integration with isolated in-memory MySQL-shaped test dou
         name: "Should not change",
         dose: "1",
         schedule: "daily",
+        doseTimes: "08:00,20:00",
+        timeZone: "America/New_York",
         active: true,
       })
       .then(
@@ -754,8 +778,39 @@ describe("phase 1 HTTP integration with isolated in-memory MySQL-shaped test dou
       );
     expect(getErrorCode(foreignMedicationUpdate)).toBe("NOT_FOUND");
 
+    const foreignEventUpdate = await caller.care.events.update
+      .mutate({
+        familyId: 10,
+        eventId: 230,
+        title: "Should not change",
+        kind: "appointment",
+        startsAtLocal: "2026-10-30T10:00",
+        timeZone: "America/New_York",
+        reminderMinutes: 30,
+      })
+      .then(
+        () => null,
+        error => error
+      );
+    expect(getErrorCode(foreignEventUpdate)).toBe("NOT_FOUND");
+    const foreignEventDelete = await caller.care.events.delete
+      .mutate({ familyId: 10, eventId: 230 })
+      .then(
+        () => null,
+        error => error
+      );
+    expect(getErrorCode(foreignEventDelete)).toBe("NOT_FOUND");
+    expect(state.careEvents.find(row => row.id === 230)?.title).toBe(
+      "Private appointment"
+    );
+
     const foreignDose = await caller.care.medications.confirm
-      .mutate({ familyId: 10, medicationId: 220, doseDate: "2026-10-28" })
+      .mutate({
+        familyId: 10,
+        medicationId: 220,
+        doseDate: "2026-10-28",
+        doseTime: "once",
+      })
       .then(
         () => null,
         error => error
@@ -985,6 +1040,8 @@ describe("phase 1 HTTP integration with isolated in-memory MySQL-shaped test dou
       name: "Owner medication",
       dose: "As prescribed",
       schedule: "Daily as written by family",
+      doseTimes: "08:00,20:00",
+      timeZone: "America/New_York",
       assigneeId: 1,
     });
     const ownerMedication = state.medications.find(
@@ -997,6 +1054,8 @@ describe("phase 1 HTTP integration with isolated in-memory MySQL-shaped test dou
         name: "Unauthorized medication edit",
         dose: "As prescribed",
         schedule: "Daily",
+        doseTimes: "08:00,20:00",
+        timeZone: "America/New_York",
         active: true,
         assigneeId: 1,
       })
@@ -1013,6 +1072,40 @@ describe("phase 1 HTTP integration with isolated in-memory MySQL-shaped test dou
         error => error
       );
     expect(getErrorCode(caregiverExport)).toBe("FORBIDDEN");
+    await owner.care.events.create.mutate({
+      familyId: created.id,
+      title: "Owner-created appointment",
+      kind: "appointment",
+      startsAtLocal: "2026-10-30T11:00",
+      timeZone: "America/New_York",
+      reminderMinutes: 60,
+    });
+    const ownerEvent = state.careEvents.find(
+      row => row.title === "Owner-created appointment"
+    )!;
+    const caregiverEventEdit = await clientFor(3).care.events.update
+      .mutate({
+        familyId: created.id,
+        eventId: ownerEvent.id,
+        title: "Unauthorized event edit",
+        kind: "appointment",
+        startsAtLocal: "2026-10-30T12:00",
+        timeZone: "America/New_York",
+        reminderMinutes: 60,
+      })
+      .then(
+        () => null,
+        error => error
+      );
+    expect(getErrorCode(caregiverEventEdit)).toBe("FORBIDDEN");
+    const caregiverEventDelete = await clientFor(3).care.events.delete
+      .mutate({ familyId: created.id, eventId: ownerEvent.id })
+      .then(
+        () => null,
+        error => error
+      );
+    expect(getErrorCode(caregiverEventDelete)).toBe("FORBIDDEN");
+    expect(ownerEvent.title).toBe("Owner-created appointment");
 
     await owner.care.families.changeRole.mutate({
       familyId: created.id,
@@ -1199,6 +1292,8 @@ describe("phase 1 HTTP integration with isolated in-memory MySQL-shaped test dou
       name: "Prescribed medicine",
       dose: "1 tablet",
       schedule: "Daily at 8:00 AM",
+      doseTimes: "08:00,20:00",
+      timeZone: "America/New_York",
       startDate: "2026-10-01",
       endDate: null,
       notes: null,
@@ -1211,6 +1306,8 @@ describe("phase 1 HTTP integration with isolated in-memory MySQL-shaped test dou
       name: medication.name,
       dose: medication.dose,
       schedule: medication.schedule,
+      doseTimes: medication.doseTimes,
+      timeZone: medication.timeZone,
       startDate: medication.startDate,
       endDate: medication.endDate,
       notes: "Family follow-up note",
@@ -1222,33 +1319,70 @@ describe("phase 1 HTTP integration with isolated in-memory MySQL-shaped test dou
       familyId: 10,
       medicationId: medication.id,
       doseDate: "2026-10-28",
+      doseTime: "08:00",
     });
     const duplicateDose = await owner.care.medications.confirm
       .mutate({
         familyId: 10,
         medicationId: medication.id,
         doseDate: "2026-10-28",
+        doseTime: "08:00",
       })
       .then(
         () => null,
         error => error
       );
     expect(getErrorCode(duplicateDose)).toBe("CONFLICT");
+    await owner.care.medications.confirm.mutate({
+      familyId: 10,
+      medicationId: medication.id,
+      doseDate: "2026-10-28",
+      doseTime: "20:00",
+    });
     expect(
       state.doseConfirmations.filter(row => row.medicationId === medication.id)
-    ).toHaveLength(1);
+    ).toHaveLength(2);
 
     await owner.care.events.create.mutate({
       familyId: 10,
       title: "Follow-up appointment",
       kind: "appointment",
-      startsAt: new Date("2026-10-30T15:00:00.000Z"),
+      startsAtLocal: "2026-10-30T11:00",
+      timeZone: "America/New_York",
       location: "Clinic",
       escortId: null,
       reminderMinutes: 60,
       questions: "Ask about next steps",
       visitNotes: null,
     });
+    const event = state.careEvents.find(row => row.familyId === 10)!;
+    expect(event.startsAt.toISOString()).toBe("2026-10-30T15:00:00.000Z");
+    await owner.care.events.update.mutate({
+      familyId: 10,
+      eventId: event.id,
+      title: "Follow-up appointment updated",
+      kind: "appointment",
+      startsAtLocal: "2026-10-30T10:00",
+      timeZone: "America/Chicago",
+      location: "Clinic",
+      escortId: null,
+      reminderMinutes: 30,
+      questions: "Ask about next steps",
+      visitNotes: null,
+    });
+    expect(event.startsAt.toISOString()).toBe("2026-10-30T15:00:00.000Z");
+    expect(event.timeZone).toBe("America/Chicago");
+    await owner.care.events.create.mutate({
+      familyId: 10,
+      title: "Temporary event",
+      kind: "visit",
+      startsAtLocal: "2026-10-31T10:00",
+      timeZone: "America/Chicago",
+      reminderMinutes: 0,
+    });
+    const temporaryEvent = state.careEvents.find(row => row.title === "Temporary event")!;
+    await owner.care.events.delete.mutate({ familyId: 10, eventId: temporaryEvent.id });
+    expect(state.careEvents.some(row => row.id === temporaryEvent.id)).toBe(false);
     await owner.care.notes.create.mutate({
       familyId: 10,
       kind: "handoff",
@@ -1259,13 +1393,13 @@ describe("phase 1 HTTP integration with isolated in-memory MySQL-shaped test dou
     const tasks = await owner.care.tasks.list.query({ familyId: 10 });
     expect(tasks[0]?.completionHistory).toHaveLength(2);
     expect(tasks[0]?.completionHistory[0]?.completedByName).toBe("Alex One");
-    const medications = await owner.care.medications.list.query({
-      familyId: 10,
-      doseDate: "2026-10-28",
-    });
-    expect(medications[0]?.today?.status).toBe("confirmed");
+    const medications = await owner.care.medications.list.query({ familyId: 10 });
+    expect(medications[0]?.doses).toHaveLength(2);
+    expect(medications[0]?.doses[0]?.confirmation?.status).toBe("confirmed");
+    expect(medications[0]?.doses[1]?.confirmation?.status).toBe("confirmed");
     const events = await owner.care.events.list.query({ familyId: 10 });
-    expect(events[0]?.title).toBe("Follow-up appointment");
+    expect(events[0]?.title).toBe("Follow-up appointment updated");
+    expect(events[0]?.timeZone).toBe("America/Chicago");
     const notes = await owner.care.notes.list.query({ familyId: 10 });
     expect(notes[0]?.body).toContain("confirmed instructions");
 
@@ -1280,7 +1414,7 @@ describe("phase 1 HTTP integration with isolated in-memory MySQL-shaped test dou
     });
     expect(exportData.taskCompletions).toHaveLength(2);
     expect(exportData.medications).toHaveLength(1);
-    expect(exportData.doseConfirmations).toHaveLength(1);
+    expect(exportData.doseConfirmations).toHaveLength(2);
     expect(exportData.events).toHaveLength(1);
     expect(exportData.careJournal).toHaveLength(1);
     expect(exportData.invitations).toHaveLength(1);
@@ -1298,13 +1432,64 @@ describe("phase 1 HTTP integration with isolated in-memory MySQL-shaped test dou
   it("rejects invalid medication dates and foreign assignees and creates one monthly successor", async () => {
     const owner = clientFor(1);
 
-    const invalidCalendarDate = await owner.care.medications.list
-      .query({ familyId: 10, doseDate: "2026-02-30" })
+    const invalidCalendarDate = await owner.care.medications.confirm
+      .mutate({
+        familyId: 10,
+        medicationId: 220,
+        doseDate: "2026-02-30",
+        doseTime: "once",
+      })
       .then(
         () => null,
         error => error
       );
     expect(getErrorCode(invalidCalendarDate)).toBe("BAD_REQUEST");
+
+    const invalidDoseTime = await owner.care.medications.confirm
+      .mutate({
+        familyId: 10,
+        medicationId: 220,
+        doseDate: "2026-10-28",
+        doseTime: "25:00",
+      })
+      .then(
+        () => null,
+        error => error
+      );
+    expect(getErrorCode(invalidDoseTime)).toBe("BAD_REQUEST");
+
+    const invalidMedicationZone = await owner.care.medications.create
+      .mutate({
+        familyId: 10,
+        name: "Invalid time zone",
+        dose: "As prescribed",
+        schedule: "Daily",
+        doseTimes: "08:00",
+        timeZone: "Not/A_Zone",
+      })
+      .then(
+        () => null,
+        error => error
+      );
+    expect(getErrorCode(invalidMedicationZone)).toBe("BAD_REQUEST");
+
+    const daylightSavingGap = await owner.care.events.create
+      .mutate({
+        familyId: 10,
+        title: "Nonexistent local time",
+        kind: "appointment",
+        startsAtLocal: "2026-03-08T02:30",
+        timeZone: "America/New_York",
+        reminderMinutes: 0,
+      })
+      .then(
+        () => null,
+        error => error
+      );
+    expect(getErrorCode(daylightSavingGap)).toBe("BAD_REQUEST");
+    expect(
+      state.careEvents.some(row => row.title === "Nonexistent local time")
+    ).toBe(false);
 
     const invertedMedicationRange = await owner.care.medications.create
       .mutate({
@@ -1312,6 +1497,8 @@ describe("phase 1 HTTP integration with isolated in-memory MySQL-shaped test dou
         name: "Invalid date range",
         dose: "As prescribed",
         schedule: "As entered by family",
+        doseTimes: "08:00",
+        timeZone: "America/New_York",
         startDate: "2026-03-02",
         endDate: "2026-02-27",
       })
@@ -1347,6 +1534,8 @@ describe("phase 1 HTTP integration with isolated in-memory MySQL-shaped test dou
         name: "Medication with foreign assignee",
         dose: "As prescribed",
         schedule: "Daily",
+        doseTimes: "08:00",
+        timeZone: "America/New_York",
         assigneeId: 2,
       })
       .then(
@@ -1360,7 +1549,8 @@ describe("phase 1 HTTP integration with isolated in-memory MySQL-shaped test dou
         familyId: 10,
         title: "Appointment with foreign escort",
         kind: "appointment",
-        startsAt: fixedNow,
+        startsAtLocal: "2026-10-29T10:00",
+        timeZone: "America/New_York",
         reminderMinutes: 60,
         escortId: 2,
       })
@@ -1438,5 +1628,150 @@ describe("phase 1 HTTP integration with isolated in-memory MySQL-shaped test dou
     expect(state.careTasks.some(row => row.id === successors[0]!.id)).toBe(
       false
     );
+  });
+
+  it("requires ownership transfer, then anonymizes shared history while deleting the account", async () => {
+    const owner = clientFor(1);
+    const now = new Date("2026-10-28T12:00:00.000Z");
+    const expiry = new Date("2026-11-04T12:00:00.000Z");
+    state.familyMembers.push({
+      id: 301,
+      familyId: 10,
+      userId: 3,
+      role: "coordinator",
+      joinedAt: now,
+    });
+    state.careTasks.push({
+      id: 302,
+      familyId: 10,
+      title: "Shared task authored by Alex",
+      description: null,
+      dueAt: null,
+      priority: "medium",
+      assigneeId: 1,
+      status: "completed",
+      recurrence: "none",
+      notes: null,
+      createdBy: 1,
+      completedBy: 1,
+      completedAt: now,
+      generatedFromTaskId: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    state.careTaskCompletions.push({
+      id: 303,
+      familyId: 10,
+      taskId: 302,
+      completedBy: 1,
+      completedAt: now,
+    });
+    state.medications.push({
+      id: 304,
+      familyId: 10,
+      name: "Shared prescription record",
+      dose: "As prescribed",
+      schedule: "As entered by family",
+      doseTimes: "08:00",
+      timeZone: "America/New_York",
+      startDate: null,
+      endDate: null,
+      notes: null,
+      assigneeId: 1,
+      active: true,
+      createdBy: 1,
+      createdAt: now,
+      updatedAt: now,
+    });
+    state.doseConfirmations.push({
+      id: 305,
+      familyId: 10,
+      medicationId: 304,
+      doseDate: "2026-10-28",
+      doseTime: "08:00",
+      status: "confirmed",
+      note: null,
+      confirmedBy: 1,
+      confirmedAt: now,
+    });
+    state.careEvents.push({
+      id: 306,
+      familyId: 10,
+      title: "Shared visit",
+      kind: "visit",
+      startsAt: now,
+      timeZone: "America/New_York",
+      location: null,
+      escortId: 1,
+      reminderMinutes: 0,
+      questions: null,
+      visitNotes: "Shared note from Alex",
+      createdBy: 1,
+      createdAt: now,
+      updatedAt: now,
+    });
+    state.careNotes.push({
+      id: 307,
+      familyId: 10,
+      kind: "handoff",
+      body: "Care context from Alex",
+      isConfirmedFact: false,
+      createdBy: 1,
+      createdAt: now,
+    });
+    state.familyInvitations.push({
+      id: 308,
+      familyId: 10,
+      email: "invited@example.test",
+      role: "viewer",
+      tokenHash: "synthetic-token-hash",
+      status: "pending",
+      invitedBy: 1,
+      acceptedBy: null,
+      createdAt: now,
+      expiresAt: expiry,
+    });
+
+    const blockedDelete = await owner.auth.deleteAccount.mutate().then(
+      () => null,
+      error => error
+    );
+    expect(getErrorCode(blockedDelete)).toBe("PRECONDITION_FAILED");
+    expect(state.users.some(user => user.id === 1)).toBe(true);
+    await owner.care.families.transferOwnership.mutate({
+      familyId: 10,
+      memberId: 301,
+    });
+
+    await expect(owner.auth.deleteAccount.mutate()).resolves.toEqual({
+      success: true,
+      sharedHistoryRetained: true,
+    });
+    const former = state.users.find(user => user.name === "Former family member")!;
+    expect(state.users.some(user => user.id === 1)).toBe(false);
+    expect(former.email).toBeNull();
+    expect(former.openId).not.toBe("test-open-id-1");
+    expect(state.familyMembers.some(member => member.userId === 1)).toBe(false);
+    expect(state.families.find(family => family.id === 10)?.createdBy).toBe(former.id);
+    expect(state.careTasks.find(task => task.id === 302)).toMatchObject({
+      createdBy: former.id,
+      completedBy: former.id,
+      assigneeId: null,
+    });
+    expect(state.careTaskCompletions.find(row => row.id === 303)?.completedBy).toBe(former.id);
+    expect(state.medications.find(row => row.id === 304)).toMatchObject({
+      createdBy: former.id,
+      assigneeId: null,
+    });
+    expect(state.doseConfirmations.find(row => row.id === 305)?.confirmedBy).toBe(former.id);
+    expect(state.careEvents.find(row => row.id === 306)).toMatchObject({
+      createdBy: former.id,
+      escortId: null,
+    });
+    expect(state.careNotes.find(row => row.id === 307)?.createdBy).toBe(former.id);
+    expect(state.familyInvitations.find(row => row.id === 308)).toMatchObject({
+      invitedBy: former.id,
+      status: "revoked",
+    });
   });
 });

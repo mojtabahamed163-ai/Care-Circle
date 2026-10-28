@@ -30,6 +30,10 @@ import CareDialog, {
 } from "@/components/CareDialogs";
 import { canCoordinateRole, canWriteRole } from "@/lib/care-permissions";
 import { trpc } from "@/lib/trpc";
+import {
+  dateKeyInZone,
+  isValidTimeZone,
+} from "@shared/timezone";
 
 type Tab =
   | "home"
@@ -69,6 +73,29 @@ const dateTime = (value: Date | string | null | undefined) =>
         minute: "2-digit",
       })
     : "Time not set";
+const eventTimeZone = (timeZone: string | null) => {
+  const deviceZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  return timeZone && isValidTimeZone(timeZone)
+    ? timeZone
+    : isValidTimeZone(deviceZone)
+      ? deviceZone
+      : "UTC";
+};
+const eventDateTime = (value: Date | string, timeZone: string | null) => {
+  const parsed = new Date(value);
+  const zone = eventTimeZone(timeZone);
+  return new Intl.DateTimeFormat("en-US", {
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    timeZone: zone,
+    timeZoneName: "short",
+  }).format(parsed);
+};
+const eventLocalDate = (value: Date | string, timeZone: string | null) =>
+  dateKeyInZone(new Date(value), eventTimeZone(timeZone));
 const reminderPreference = (minutes: number) => {
   if (minutes === 0) return "No reminder";
   if (minutes === 60) return "1 hour before";
@@ -163,10 +190,7 @@ export default function Home() {
     families.data?.find(family => family.id === familyId) ?? families.data?.[0];
   const enabled = !!me.data && familyId > 0;
   const tasks = trpc.care.tasks.list.useQuery({ familyId }, { enabled });
-  const medications = trpc.care.medications.list.useQuery(
-    { familyId, doseDate: todayKey() },
-    { enabled }
-  );
+  const medications = trpc.care.medications.list.useQuery({ familyId }, { enabled });
   const events = trpc.care.events.list.useQuery({ familyId }, { enabled });
   const notes = trpc.care.notes.list.useQuery({ familyId }, { enabled });
   const members = trpc.care.families.members.useQuery(
@@ -212,7 +236,6 @@ export default function Home() {
             utils.care.tasks.list.invalidate({ familyId }),
             utils.care.medications.list.invalidate({
               familyId,
-              doseDate: todayKey(),
             }),
             utils.care.events.list.invalidate({ familyId }),
             utils.care.notes.list.invalidate({ familyId }),
@@ -237,6 +260,8 @@ export default function Home() {
   const updateMedication = trpc.care.medications.update.useMutation();
   const confirmDose = trpc.care.medications.confirm.useMutation();
   const createEvent = trpc.care.events.create.useMutation();
+  const updateEvent = trpc.care.events.update.useMutation();
+  const deleteEvent = trpc.care.events.delete.useMutation();
   const createNote = trpc.care.notes.create.useMutation();
   const createInvitation = trpc.care.families.invite.useMutation();
   const acceptInvitation = trpc.care.invitations.accept.useMutation();
@@ -247,6 +272,7 @@ export default function Home() {
   const removeMember = trpc.care.families.removeMember.useMutation();
   const leaveFamily = trpc.care.families.leave.useMutation();
   const logout = trpc.auth.logout.useMutation();
+  const deleteAccount = trpc.auth.deleteAccount.useMutation();
 
   const taskRows = tasks.data ?? [];
   const medicationRows = medications.data ?? [];
@@ -271,7 +297,10 @@ export default function Home() {
   const unassignedCount = taskRows.filter(
     task => !task.assigneeId && task.status !== "completed"
   ).length;
-  const unconfirmedCount = medicationRows.filter(med => !med.today).length;
+  const unconfirmedCount = medicationRows.reduce(
+    (sum, med) => sum + med.doses.filter(dose => !dose.confirmation).length,
+    0
+  );
   const nextEvent = eventRows.find(event => new Date(event.startsAt) >= now);
   const queryError =
     tasks.error ||
@@ -372,6 +401,8 @@ export default function Home() {
           name: values.name.trim(),
           dose: values.dose.trim(),
           schedule: values.schedule.trim(),
+          doseTimes: values.doseTimes.trim(),
+          timeZone: values.timeZone.trim(),
           startDate: values.startDate || null,
           endDate: values.endDate || null,
           notes: values.notes || null,
@@ -390,18 +421,29 @@ export default function Home() {
             : "Medication added to the family list."
         );
       } else if (kind === "event") {
-        await createEvent.mutateAsync({
+        const eventMode = dialog?.kind === "event" ? dialog : null;
+        const fields = {
           familyId,
           title: values.title.trim(),
           kind: values.kind as "appointment" | "visit",
-          startsAt: new Date(values.startsAt),
+          startsAtLocal: values.startsAtLocal,
+          timeZone: values.timeZone.trim(),
           location: values.location || null,
           escortId: assignment,
           reminderMinutes: Number(values.reminderMinutes),
           questions: values.questions || null,
           visitNotes: values.visitNotes || null,
-        });
-        toast.success("Appointment added to the family calendar.");
+        };
+        if (eventMode?.item) {
+          await updateEvent.mutateAsync({
+            ...fields,
+            eventId: eventMode.item.id,
+          });
+          toast.success("Appointment or visit updated.");
+        } else {
+          await createEvent.mutateAsync(fields);
+          toast.success("Appointment added to the family calendar.");
+        }
       } else if (kind === "note") {
         await createNote.mutateAsync({
           familyId,
@@ -437,7 +479,10 @@ export default function Home() {
         await confirmDose.mutateAsync({
           familyId,
           medicationId: dialog.medicationId,
-          doseDate: todayKey(),
+          doseDate:
+            medicationRows.find(med => med.id === dialog.medicationId)?.doseDate ??
+            todayKey(),
+          doseTime: dialog.doseTime,
           note: values.note || null,
         });
         toast.success(
@@ -692,7 +737,11 @@ export default function Home() {
   weekLimit.setDate(weekLimit.getDate() + 7);
   const visibleEvents = upcomingEvents.filter(event =>
     calendarRange === "day"
-      ? new Date(event.startsAt).toDateString() === now.toDateString()
+      ? eventLocalDate(event.startsAt, event.timeZone) ===
+        dateKeyInZone(
+          now,
+          eventTimeZone(event.timeZone)
+        )
       : new Date(event.startsAt) < weekLimit
   );
   const displayName = me.data.name?.trim().split(/\s+/)[0] || "there";
@@ -949,13 +998,13 @@ export default function Home() {
                     <div className="next-event">
                       <div className="event-date-tile">
                         <span>
-                          {new Date(nextEvent.startsAt).toLocaleDateString(
+                          {new Date(`${eventLocalDate(nextEvent.startsAt, nextEvent.timeZone)}T12:00:00Z`).toLocaleDateString(
                             "en-US",
-                            { month: "short" }
+                            { month: "short", timeZone: "UTC" }
                           )}
                         </span>
                         <strong>
-                          {new Date(nextEvent.startsAt).getDate()}
+                          {eventLocalDate(nextEvent.startsAt, nextEvent.timeZone).slice(8, 10)}
                         </strong>
                       </div>
                       <div>
@@ -965,7 +1014,7 @@ export default function Home() {
                             : "FAMILY VISIT"}
                         </span>
                         <h3>{nextEvent.title}</h3>
-                        <p>{dateTime(nextEvent.startsAt)}</p>
+                        <p>{eventDateTime(nextEvent.startsAt, nextEvent.timeZone)}</p>
                         {nextEvent.location && (
                           <small>{nextEvent.location}</small>
                         )}
@@ -1173,12 +1222,12 @@ export default function Home() {
                     <article className="event-row" key={event.id}>
                       <div className="event-date-tile">
                         <span>
-                          {new Date(event.startsAt).toLocaleDateString(
+                          {new Date(`${eventLocalDate(event.startsAt, event.timeZone)}T12:00:00Z`).toLocaleDateString(
                             "en-US",
-                            { month: "short" }
+                            { month: "short", timeZone: "UTC" }
                           )}
                         </span>
-                        <strong>{new Date(event.startsAt).getDate()}</strong>
+                        <strong>{eventLocalDate(event.startsAt, event.timeZone).slice(8, 10)}</strong>
                       </div>
                       <div className="event-row-body">
                         <span className="event-kind">
@@ -1187,7 +1236,7 @@ export default function Home() {
                             : "FAMILY VISIT"}
                         </span>
                         <h3>{event.title}</h3>
-                        <p>{dateTime(event.startsAt)}</p>
+                        <p>{eventDateTime(event.startsAt, event.timeZone)}</p>
                         {event.location && <small>{event.location}</small>}
                         {event.escortName && (
                           <small className="escort-label">
@@ -1211,6 +1260,32 @@ export default function Home() {
                         <Clock3 size={13} />
                         {reminderPreference(event.reminderMinutes)}
                       </span>
+                      {canWrite &&
+                        (canCoordinate || event.createdBy === me.data?.id) && (
+                          <div className="event-actions">
+                            <button
+                              className="button button-subtle small-button"
+                              onClick={() => setDialog({ kind: "event", item: event })}
+                            >
+                              Edit
+                            </button>
+                            <button
+                              className="text-danger"
+                              onClick={async () => {
+                                if (!window.confirm(`Delete “${event.title}”? This cannot be undone.`)) return;
+                                try {
+                                  await deleteEvent.mutateAsync({ familyId, eventId: event.id });
+                                  await refresh();
+                                  toast.success("Event deleted.");
+                                } catch (error) {
+                                  showError(error);
+                                }
+                              }}
+                            >
+                              Delete
+                            </button>
+                          </div>
+                        )}
                     </article>
                   ))}
                 </div>
@@ -1233,9 +1308,8 @@ export default function Home() {
                 />
               )}
               <p className="form-hint calendar-hint">
-                Calendar times use your device’s local time. Reminder
-                preferences are saved, but this first stage does not send
-                notifications.
+                Each event is shown in its saved time zone. Reminder preferences
+                are saved, but this first stage does not send notifications.
               </p>
             </section>
           )}
@@ -1249,10 +1323,9 @@ export default function Home() {
                 <p>
                   <strong>Family tracking only.</strong> Follow the clinician’s
                   instructions. A reminder or open screen is not confirmation,
-                  and this app does not verify whether a dose was given. No
-                  automated reminders are sent in this stage. One check-in is
-                  recorded per medication per local date; multiple daily doses
-                  are not tracked as separate entries here.
+                  and this app does not verify whether a dose was given. Each
+                  scheduled time has its own confirmation for the medication’s
+                  local date. Automated reminders are not sent in this stage.
                 </p>
               </div>
               <section className="panel full-panel">
@@ -1273,18 +1346,17 @@ export default function Home() {
                           <div className="med-title-line">
                             <h3>{med.name}</h3>
                             <span
-                              className={`confirmation-pill ${med.today ? (med.today.status === "confirmed" ? "confirmed" : "follow-up") : "pending"}`}
+                              className={`confirmation-pill ${med.doses.some(dose => !dose.confirmation) ? "pending" : "confirmed"}`}
                             >
-                              {med.today
-                                ? med.today.status === "confirmed"
-                                  ? "Confirmation recorded today"
-                                  : "Follow-up note recorded"
-                                : "No confirmation recorded today"}
+                              {med.doses.filter(dose => !dose.confirmation).length
+                                ? `${med.doses.filter(dose => !dose.confirmation).length} dose${med.doses.filter(dose => !dose.confirmation).length === 1 ? "" : "s"} not confirmed`
+                                : "All scheduled doses confirmed"}
                             </span>
                           </div>
                           <p className="med-dose">
                             {med.dose} <span>·</span> {med.schedule}
                           </p>
+                          <small>Times follow {med.timeZone} · local date {med.doseDate}</small>
                           {med.assigneeName && (
                             <small>Point person: {med.assigneeName}</small>
                           )}
@@ -1297,30 +1369,41 @@ export default function Home() {
                             </small>
                           )}
                           {med.notes && <p className="med-note">{med.notes}</p>}
-                          {med.today && (
-                            <p className="confirmation-meta">
-                              Recorded by{" "}
-                              {med.today.confirmerName || "a family member"} ·{" "}
-                              {dateTime(med.today.confirmedAt)}
-                              {med.today.note ? ` · ${med.today.note}` : ""}
-                            </p>
-                          )}
+                          <div className="dose-list">
+                            {med.doses.map(dose => {
+                              const confirmation = dose.confirmation;
+                              return (
+                                <div className="dose-row" key={`${med.id}-${dose.time}`}>
+                                  <div className="dose-row-copy">
+                                    <strong>{dose.time === "once" ? "Daily dose" : dose.time}</strong>
+                                    {confirmation ? (
+                                      <span className="dose-confirmation-meta">
+                                        {confirmation.status === "confirmed" ? "Confirmed" : "Follow-up needed"} by {confirmation.confirmerName || "a family member"} · {dateTime(confirmation.confirmedAt)}
+                                        {confirmation.note ? ` · ${confirmation.note}` : ""}
+                                      </span>
+                                    ) : (
+                                      <span>Not confirmed for this local date</span>
+                                    )}
+                                  </div>
+                                  {canWrite && !confirmation && (
+                                    <button
+                                      className="button button-subtle small-button"
+                                      onClick={() => setDialog({
+                                        kind: "dose",
+                                        medicationId: med.id,
+                                        medicationName: med.name,
+                                        doseTime: dose.time,
+                                      })}
+                                    >
+                                      Record confirmation
+                                    </button>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
                         </div>
                         <div className="med-actions">
-                          {canWrite && !med.today && (
-                            <button
-                              className="button button-subtle small-button"
-                              onClick={() =>
-                                setDialog({
-                                  kind: "dose",
-                                  medicationId: med.id,
-                                  medicationName: med.name,
-                                })
-                              }
-                            >
-                              Record today
-                            </button>
-                          )}
                           {canWrite &&
                             (canCoordinate ||
                               med.createdBy === me.data?.id ||
@@ -1666,6 +1749,38 @@ export default function Home() {
                 </article>
                 <article>
                   <h3>
+                    <ClipboardList size={17} /> Information stored
+                  </h3>
+                  <p>
+                    The app stores account identifiers and profile details, family names and membership roles, invitation records, and the care information you enter: tasks, medication names and prescribed-dose notes, dose schedules and confirmations, appointments, and journal entries. Do not enter details you are not authorized to share.
+                  </p>
+                </article>
+                <article>
+                  <h3>
+                    <Heart size={17} /> Purpose and access
+                  </h3>
+                  <p>
+                    Information is used to coordinate care within the selected family space. Signed-in family members with active membership can view shared records; server-side role checks control write, management, and export actions. Invite links grant access only after the invited person accepts.
+                  </p>
+                </article>
+                <article>
+                  <h3>
+                    <ShieldCheck size={17} /> Storage and sharing
+                  </h3>
+                  <p>
+                    Care Circle stores shared records in its application database and processes sign-in through the configured Manus account service. This version does not send family invitations or medication reminders by email and does not use a paid AI service. The platform’s own service terms and safeguards also apply.
+                  </p>
+                </article>
+                <article>
+                  <h3>
+                    <Download size={17} /> Export and retention
+                  </h3>
+                  <p>
+                    An owner or coordinator can download the selected family’s shared records as JSON. Shared records are retained for family continuity until handled through available in-product actions. No separate backup or recovery promise is made by this policy.
+                  </p>
+                </article>
+                <article>
+                  <h3>
                     <ShieldCheck size={17} /> Use care with sensitive details
                   </h3>
                   <p>
@@ -1714,11 +1829,41 @@ export default function Home() {
                     : "Combined family exports are limited to the family owner or coordinator. Ask one of them to prepare an export."}
                 </p>
               </div>
+              <section className="account-deletion">
+                <h3>Delete your Care Circle account</h3>
+                <p>
+                  Deletion removes your Care Circle profile and sign-in identifier, removes your family memberships, clears your personal task assignments, and cancels your pending invitations. Shared family history is retained; direct authorship is replaced with “Former family member,” and the text you entered may remain visible to the family. Ownership must be transferred for every family you own before deletion can proceed. This does not delete your Manus account.
+                </p>
+                <button
+                  className="button button-danger"
+                  disabled={deleteAccount.isPending}
+                  onClick={async () => {
+                    const confirmed = window.confirm(
+                      "Permanently delete your Care Circle account? Your profile and access will be removed, but shared family history and text you entered may remain under ‘Former family member.’ This cannot be undone."
+                    );
+                    if (!confirmed) return;
+                    try {
+                      await deleteAccount.mutateAsync();
+                      try {
+                        sessionStorage.removeItem("manus-cookie");
+                        localStorage.removeItem("manus-runtime-user-info");
+                        localStorage.removeItem("care-circle-family");
+                      } catch {}
+                      toast.success("Your Care Circle account was deleted.");
+                      window.location.assign("/");
+                    } catch (error) {
+                      showError(error);
+                    }
+                  }}
+                >
+                  {deleteAccount.isPending ? "Deleting account…" : "Delete my account"}
+                </button>
+                <small>
+                  If you own a family, transfer ownership first. If you sign in again later with the same Manus identity, a new Care Circle account may be created.
+                </small>
+              </section>
               <p className="privacy-implementation-note">
-                This is an in-product safety and privacy summary, not a legal
-                privacy policy. Automated email and external reminders are not
-                available in this stage. A self-service account deletion flow is
-                not available yet.
+                This in-product privacy disclosure describes this version’s behavior. It is not legal advice or a legal review, and Care Circle does not claim HIPAA compliance. Care Circle is not a medical, clinical, or emergency service. For emergencies, contact local emergency services.
               </p>
             </section>
           )}
