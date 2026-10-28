@@ -163,7 +163,8 @@ export async function listMembers(userId: number, familyId: number) {
 }
 
 export async function exportFamily(userId: number, familyId: number) {
-  await requireMembership(userId, familyId);
+  const role = await requireMembership(userId, familyId);
+  requireManager(role);
   const db = await getDb();
   if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
   const [family] = await db
@@ -179,6 +180,7 @@ export async function exportFamily(userId: number, familyId: number) {
   const [
     members,
     tasks,
+    taskCompletions,
     medicationRows,
     doseConfirmationsRows,
     events,
@@ -203,6 +205,18 @@ export async function exportFamily(userId: number, familyId: number) {
       .from(careTasks)
       .where(eq(careTasks.familyId, familyId))
       .orderBy(asc(careTasks.createdAt)),
+    db
+      .select({
+        id: careTaskCompletions.id,
+        taskId: careTaskCompletions.taskId,
+        completedBy: careTaskCompletions.completedBy,
+        completedByName: users.name,
+        completedAt: careTaskCompletions.completedAt,
+      })
+      .from(careTaskCompletions)
+      .leftJoin(users, eq(careTaskCompletions.completedBy, users.id))
+      .where(eq(careTaskCompletions.familyId, familyId))
+      .orderBy(asc(careTaskCompletions.completedAt)),
     db
       .select()
       .from(medications)
@@ -243,6 +257,7 @@ export async function exportFamily(userId: number, familyId: number) {
     family,
     members,
     tasks,
+    taskCompletions,
     medications: medicationRows,
     doseConfirmations: doseConfirmationsRows,
     events,
@@ -450,8 +465,80 @@ export async function changeMemberRole(
   await db
     .update(familyMembers)
     .set({ role: nextRole })
-    .where(eq(familyMembers.id, memberId));
+    .where(
+      and(eq(familyMembers.id, memberId), eq(familyMembers.familyId, familyId))
+    );
   return { success: true };
+}
+
+export async function transferOwnership(
+  userId: number,
+  familyId: number,
+  memberId: number
+) {
+  const currentRole = await requireMembership(userId, familyId);
+  if (currentRole !== "owner")
+    throw new TRPCError({
+      code: "FORBIDDEN",
+      message: "Only the current family owner can transfer ownership.",
+    });
+  const db = await getDb();
+  if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
+
+  return db.transaction(async tx => {
+    const [owner] = await tx
+      .select({ id: familyMembers.id, role: familyMembers.role })
+      .from(familyMembers)
+      .where(
+        and(
+          eq(familyMembers.familyId, familyId),
+          eq(familyMembers.userId, userId)
+        )
+      )
+      .limit(1)
+      .for("update");
+    if (!owner || owner.role !== "owner")
+      throw new TRPCError({ code: "CONFLICT" });
+
+    const [target] = await tx
+      .select({ id: familyMembers.id, role: familyMembers.role })
+      .from(familyMembers)
+      .where(
+        and(
+          eq(familyMembers.id, memberId),
+          eq(familyMembers.familyId, familyId)
+        )
+      )
+      .limit(1)
+      .for("update");
+    if (!target) throw new TRPCError({ code: "NOT_FOUND" });
+    if (target.role === "owner")
+      throw new TRPCError({
+        code: "CONFLICT",
+        message: "This family already has an owner.",
+      });
+
+    await tx
+      .update(familyMembers)
+      .set({ role: "coordinator" })
+      .where(
+        and(
+          eq(familyMembers.id, owner.id),
+          eq(familyMembers.familyId, familyId),
+          eq(familyMembers.role, "owner")
+        )
+      );
+    await tx
+      .update(familyMembers)
+      .set({ role: "owner" })
+      .where(
+        and(
+          eq(familyMembers.id, target.id),
+          eq(familyMembers.familyId, familyId)
+        )
+      );
+    return { success: true };
+  });
 }
 
 export async function removeMember(
@@ -476,7 +563,11 @@ export async function removeMember(
       code: "FORBIDDEN",
       message: "The family owner cannot be removed.",
     });
-  await db.delete(familyMembers).where(eq(familyMembers.id, memberId));
+  await db
+    .delete(familyMembers)
+    .where(
+      and(eq(familyMembers.id, memberId), eq(familyMembers.familyId, familyId))
+    );
   return { success: true };
 }
 
@@ -702,13 +793,19 @@ export async function updateTask(
           .values({
             familyId,
             title: input.title.trim(),
-            description: input.description ?? lockedTask.description,
+            description:
+              input.description === undefined
+                ? lockedTask.description
+                : input.description,
             dueAt: nextDueAt,
             priority: input.priority,
-            assigneeId: input.assigneeId ?? lockedTask.assigneeId,
+            assigneeId:
+              input.assigneeId === undefined
+                ? lockedTask.assigneeId
+                : input.assigneeId,
             status: "new",
             recurrence: input.recurrence,
-            notes: input.notes ?? lockedTask.notes,
+            notes: input.notes === undefined ? lockedTask.notes : input.notes,
             createdBy: userId,
             generatedFromTaskId: taskId,
           })
@@ -753,6 +850,7 @@ export async function listMedications(
       notes: medications.notes,
       assigneeId: medications.assigneeId,
       active: medications.active,
+      createdBy: medications.createdBy,
       assigneeName: users.name,
     })
     .from(medications)

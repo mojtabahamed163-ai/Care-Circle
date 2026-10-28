@@ -81,6 +81,11 @@ export const appRouter = router({
             input.role
           )
         ),
+      transferOwnership: protectedProcedure
+        .input(z.object({ familyId, memberId: z.number().int().positive() }))
+        .mutation(({ ctx, input }) =>
+          care.transferOwnership(ctx.user.id, input.familyId, input.memberId)
+        ),
       removeMember: protectedProcedure
         .input(z.object({ familyId, memberId: z.number().int().positive() }))
         .mutation(({ ctx, input }) =>

@@ -28,6 +28,7 @@ import CareDialog, {
   type CareDialogMode,
   type FamilyMemberOption,
 } from "@/components/CareDialogs";
+import { canCoordinateRole, canWriteRole } from "@/lib/care-permissions";
 import { trpc } from "@/lib/trpc";
 
 type Tab =
@@ -143,6 +144,7 @@ export default function Home() {
   const [dialog, setDialog] = useState<CareDialogMode | null>(null);
   const [busy, setBusy] = useState(false);
   const [inviteLink, setInviteLink] = useState("");
+  const [transferTargetId, setTransferTargetId] = useState<number | null>(null);
 
   const me = trpc.auth.me.useQuery();
   const isInvitationPath = path.startsWith("/invite/");
@@ -241,6 +243,7 @@ export default function Home() {
   const declineInvitation = trpc.care.invitations.decline.useMutation();
   const revokeInvitation = trpc.care.families.revokeInvitation.useMutation();
   const changeRole = trpc.care.families.changeRole.useMutation();
+  const transferOwnership = trpc.care.families.transferOwnership.useMutation();
   const removeMember = trpc.care.families.removeMember.useMutation();
   const leaveFamily = trpc.care.families.leave.useMutation();
   const logout = trpc.auth.logout.useMutation();
@@ -665,10 +668,8 @@ export default function Home() {
     { id: "journal", title: "Care journal", icon: Activity },
     { id: "family", title: "Family circle", icon: Users },
   ];
-  const canCoordinate = ["owner", "coordinator"].includes(
-    currentFamily?.role ?? ""
-  );
-  const canWrite = currentFamily?.role !== "viewer";
+  const canCoordinate = canCoordinateRole(currentFamily?.role);
+  const canWrite = canWriteRole(currentFamily?.role);
   const openTask = (task?: (typeof taskRows)[number]) =>
     setDialog(task ? { kind: "task", item: task } : { kind: "task" });
   const openMedication = (medication?: (typeof medicationRows)[number]) =>
@@ -907,10 +908,15 @@ export default function Home() {
                         <TaskRow
                           key={task.id}
                           task={task}
+                          canEdit={
+                            canWrite &&
+                            (canCoordinate ||
+                              task.createdBy === me.data?.id ||
+                              task.assigneeId === me.data?.id)
+                          }
                           isOverdue={isOverdue(task)}
                           onEdit={() => openTask(task)}
                           onComplete={() => changeTaskStatus(task, "completed")}
-                          readOnly={!canWrite}
                         />
                       ))}
                     </div>
@@ -971,12 +977,14 @@ export default function Home() {
                       title="No upcoming visits yet"
                       body="Keep the family in sync by adding an appointment or visit."
                       action={
-                        <button
-                          className="text-action"
-                          onClick={() => setDialog({ kind: "event" })}
-                        >
-                          Add to calendar <ArrowUpRight size={14} />
-                        </button>
+                        canWrite && (
+                          <button
+                            className="text-action"
+                            onClick={() => setDialog({ kind: "event" })}
+                          >
+                            Add to calendar <ArrowUpRight size={14} />
+                          </button>
+                        )
                       }
                     />
                   )}
@@ -1021,12 +1029,14 @@ export default function Home() {
                     <span>
                       Leave a short note for the next person stepping in.
                     </span>
-                    <button
-                      className="text-action"
-                      onClick={() => setDialog({ kind: "note" })}
-                    >
-                      Add an update <Plus size={14} />
-                    </button>
+                    {canWrite && (
+                      <button
+                        className="text-action"
+                        onClick={() => setDialog({ kind: "note" })}
+                      >
+                        Add an update <Plus size={14} />
+                      </button>
+                    )}
                   </div>
                 )}
               </section>
@@ -1061,6 +1071,12 @@ export default function Home() {
                       <TaskRow
                         key={task.id}
                         task={task}
+                        canEdit={
+                          canWrite &&
+                          (canCoordinate ||
+                            task.createdBy === me.data?.id ||
+                            task.assigneeId === me.data?.id)
+                        }
                         isOverdue={isOverdue(task)}
                         onEdit={() => openTask(task)}
                         onComplete={() =>
@@ -1090,7 +1106,6 @@ export default function Home() {
                           }
                         }}
                         showDelete={canCoordinate}
-                        readOnly={!canWrite}
                       />
                     ))}
                 </div>
@@ -1306,16 +1321,22 @@ export default function Home() {
                               Record today
                             </button>
                           )}
-                          {canWrite && (
-                            <button
-                              className="icon-button"
-                              aria-label={`Edit ${med.name}`}
-                              onClick={() => openMedication(med)}
-                            >
-                              <span className="edit-word">Edit</span>
-                              <ChevronDown className="edit-chevron" size={15} />
-                            </button>
-                          )}
+                          {canWrite &&
+                            (canCoordinate ||
+                              med.createdBy === me.data?.id ||
+                              med.assigneeId === me.data?.id) && (
+                              <button
+                                className="icon-button"
+                                aria-label={`Edit ${med.name}`}
+                                onClick={() => openMedication(med)}
+                              >
+                                <span className="edit-word">Edit</span>
+                                <ChevronDown
+                                  className="edit-chevron"
+                                  size={15}
+                                />
+                              </button>
+                            )}
                         </div>
                       </article>
                     ))}
@@ -1486,27 +1507,92 @@ export default function Home() {
                     Your role is <strong>{currentFamily?.role}</strong>. Only
                     members of this family can view its care information.
                   </p>
-                  <button
-                    className="text-danger leave-button"
-                    onClick={async () => {
-                      if (
-                        !window.confirm(
-                          "Leave this family? You’ll lose access to its shared care information."
+                  {currentFamily?.role === "owner" ? (
+                    <div className="transfer-owner-control">
+                      <label className="field">
+                        <span>Transfer ownership to a current member</span>
+                        <select
+                          value={transferTargetId ?? ""}
+                          onChange={event =>
+                            setTransferTargetId(
+                              Number(event.target.value) || null
+                            )
+                          }
+                        >
+                          <option value="">Choose a family member</option>
+                          {memberRows
+                            .filter(member => member.role !== "owner")
+                            .map(member => (
+                              <option key={member.id} value={member.id}>
+                                {member.name || "Family member"}
+                              </option>
+                            ))}
+                        </select>
+                      </label>
+                      <button
+                        className="button button-subtle small-button"
+                        disabled={
+                          !transferTargetId || transferOwnership.isPending
+                        }
+                        onClick={async () => {
+                          if (!transferTargetId) return;
+                          const target = memberRows.find(
+                            member => member.id === transferTargetId
+                          );
+                          if (!target) return;
+                          if (
+                            !window.confirm(
+                              `Transfer ownership to ${target.name || "this member"}? You will become a coordinator and can leave afterward.`
+                            )
+                          )
+                            return;
+                          try {
+                            await transferOwnership.mutateAsync({
+                              familyId,
+                              memberId: transferTargetId,
+                            });
+                            setTransferTargetId(null);
+                            await refresh();
+                            toast.success(
+                              "Ownership transferred. Your role is now coordinator."
+                            );
+                          } catch (error) {
+                            showError(error);
+                          }
+                        }}
+                      >
+                        {transferOwnership.isPending
+                          ? "Transferring…"
+                          : "Transfer ownership"}
+                      </button>
+                      <small className="transfer-owner-hint">
+                        Transfer first to become a coordinator, then leave if
+                        needed.
+                      </small>
+                    </div>
+                  ) : (
+                    <button
+                      className="text-danger leave-button"
+                      onClick={async () => {
+                        if (
+                          !window.confirm(
+                            "Leave this family? You’ll lose access to its shared care information."
+                          )
                         )
-                      )
-                        return;
-                      try {
-                        await leaveFamily.mutateAsync({ familyId });
-                        setSelectedId(null);
-                        await utils.care.families.list.invalidate();
-                        toast.success("You left the family space.");
-                      } catch (error) {
-                        showError(error);
-                      }
-                    }}
-                  >
-                    Leave family space
-                  </button>
+                          return;
+                        try {
+                          await leaveFamily.mutateAsync({ familyId });
+                          setSelectedId(null);
+                          await utils.care.families.list.invalidate();
+                          toast.success("You left the family space.");
+                        } catch (error) {
+                          showError(error);
+                        }
+                      }}
+                    >
+                      Leave family space
+                    </button>
+                  )}
                 </section>
                 {canCoordinate && (
                   <section className="panel invitations-panel">
@@ -1610,19 +1696,22 @@ export default function Home() {
                 </article>
               </div>
               <div className="privacy-actions">
-                <button
-                  className="button button-subtle"
-                  onClick={downloadFamilyExport}
-                  disabled={exportFamily.isPending}
-                >
-                  <Download size={16} />
-                  {exportFamily.isPending
-                    ? "Preparing export…"
-                    : "Download this family’s data"}
-                </button>
+                {canCoordinate && (
+                  <button
+                    className="button button-subtle"
+                    onClick={downloadFamilyExport}
+                    disabled={exportFamily.isPending}
+                  >
+                    <Download size={16} />
+                    {exportFamily.isPending
+                      ? "Preparing export…"
+                      : "Download this family’s data"}
+                  </button>
+                )}
                 <p>
-                  Exports the selected family’s shared records to this device as
-                  JSON. No other family spaces are included.
+                  {canCoordinate
+                    ? "Exports the selected family’s shared records to this device as JSON. No other family spaces are included."
+                    : "Combined family exports are limited to the family owner or coordinator. Ask one of them to prepare an export."}
                 </p>
               </div>
               <p className="privacy-implementation-note">
@@ -1867,7 +1956,7 @@ function TaskRow({
   onComplete,
   onDelete,
   showDelete = false,
-  readOnly = false,
+  canEdit,
 }: {
   task: {
     id: number;
@@ -1876,6 +1965,7 @@ function TaskRow({
     dueAt: Date | null;
     priority: string;
     assigneeId: number | null;
+    createdBy: number;
     assigneeName: string | null;
     status: string;
     recurrence: string;
@@ -1892,40 +1982,60 @@ function TaskRow({
   onComplete: () => void;
   onDelete?: () => void;
   showDelete?: boolean;
-  readOnly?: boolean;
+  canEdit: boolean;
 }) {
+  const taskCopy = (
+    <>
+      <strong>{task.title}</strong>
+      {task.description && <small>{task.description}</small>}
+      <span className="task-metadata">
+        <span className={isOverdue ? "meta-overdue" : ""}>
+          {isOverdue ? "Past due · " : ""}
+          {shortDate(task.dueAt)}
+        </span>
+        <span className="meta-separator">·</span>
+        <span>{task.assigneeName || "Unassigned"}</span>
+        {task.recurrence !== "none" && (
+          <span className="repeat-tag">Repeats {task.recurrence}</span>
+        )}
+        {task.status === "in_progress" && (
+          <span className="in-progress-tag">In progress</span>
+        )}
+      </span>
+    </>
+  );
   return (
     <article
       className={`task-row ${task.status === "completed" ? "task-complete" : ""}`}
     >
-      <button
-        className={`task-check ${task.status === "completed" ? "checked" : ""}`}
-        aria-label={
-          task.status === "completed" ? "Reopen task" : "Mark task complete"
-        }
-        onClick={onComplete}
-        disabled={readOnly}
-      >
-        {task.status === "completed" && <Check size={13} />}
-      </button>
-      <button className="task-copy" onClick={onEdit} disabled={readOnly}>
-        <strong>{task.title}</strong>
-        {task.description && <small>{task.description}</small>}
-        <span className="task-metadata">
-          <span className={isOverdue ? "meta-overdue" : ""}>
-            {isOverdue ? "Past due · " : ""}
-            {shortDate(task.dueAt)}
-          </span>
-          <span className="meta-separator">·</span>
-          <span>{task.assigneeName || "Unassigned"}</span>
-          {task.recurrence !== "none" && (
-            <span className="repeat-tag">Repeats {task.recurrence}</span>
-          )}
-          {task.status === "in_progress" && (
-            <span className="in-progress-tag">In progress</span>
-          )}
+      {canEdit ? (
+        <button
+          className={`task-check ${task.status === "completed" ? "checked" : ""}`}
+          aria-label={
+            task.status === "completed" ? "Reopen task" : "Mark task complete"
+          }
+          onClick={onComplete}
+        >
+          {task.status === "completed" && <Check size={13} />}
+        </button>
+      ) : (
+        <span
+          className={`task-check task-check-static ${task.status === "completed" ? "checked" : ""}`}
+          role="img"
+          aria-label={
+            task.status === "completed" ? "Task completed" : "Task open"
+          }
+        >
+          {task.status === "completed" && <Check size={13} />}
         </span>
-      </button>
+      )}
+      {canEdit ? (
+        <button className="task-copy" onClick={onEdit}>
+          {taskCopy}
+        </button>
+      ) : (
+        <div className="task-copy">{taskCopy}</div>
+      )}
       <span className={`priority-pill priority-${task.priority}`}>
         {task.priority}
       </span>
