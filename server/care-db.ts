@@ -13,6 +13,7 @@ import {
 } from "drizzle-orm";
 import { TRPCError } from "@trpc/server";
 import {
+  canConfirmDoseAt,
   dateKeyInZone,
   isValidTimeZone,
   resolveLocalDateTime,
@@ -1153,7 +1154,8 @@ export async function confirmDose(
     const timeZone = isValidTimeZone(medication.timeZone)
       ? medication.timeZone
       : "UTC";
-    const today = dateKeyInZone(new Date(), timeZone);
+    const now = new Date();
+    const today = dateKeyInZone(now, timeZone);
     if (doseDate !== today)
       throw new TRPCError({ code: "BAD_REQUEST", message: "Confirmations are recorded for the medication's current local date only." });
     if (
@@ -1163,6 +1165,11 @@ export async function confirmDose(
       throw new TRPCError({ code: "BAD_REQUEST", message: "This medication is outside its active date range." });
     if (!storedDoseTimes(medication.doseTimes).includes(doseTime))
       throw new TRPCError({ code: "BAD_REQUEST", message: "Choose a scheduled dose time." });
+    if (!canConfirmDoseAt(doseDate, doseTime, timeZone, now))
+      throw new TRPCError({
+        code: "BAD_REQUEST",
+        message: "This dose cannot be confirmed before its scheduled local time.",
+      });
     const [existing] = await tx
       .select({ id: doseConfirmations.id })
       .from(doseConfirmations)

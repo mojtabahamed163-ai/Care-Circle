@@ -8,6 +8,7 @@ import { MySqlDialect } from "drizzle-orm/mysql-core";
 import superjson from "superjson";
 import {
   afterAll,
+  afterEach,
   beforeAll,
   beforeEach,
   describe,
@@ -534,6 +535,10 @@ describe("phase 1 HTTP integration with isolated in-memory MySQL-shaped test dou
       testUsers.find(user => user.openId === openId)
     );
     databaseMocks.upsertUser.mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   it("rejects unauthenticated HTTP calls to protected care procedures", async () => {
@@ -1252,6 +1257,8 @@ describe("phase 1 HTTP integration with isolated in-memory MySQL-shaped test dou
   });
 
   it("records tasks, medication confirmations, appointments and journal entries, then exports their family-scoped history", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-10-28T12:00:00.000Z"));
     const owner = clientFor(1);
     const dueAt = new Date("2026-10-29T15:00:00.000Z");
     await owner.care.tasks.create.mutate({
@@ -1321,6 +1328,22 @@ describe("phase 1 HTTP integration with isolated in-memory MySQL-shaped test dou
       doseDate: "2026-10-28",
       doseTime: "08:00",
     });
+    const earlyDose = await owner.care.medications.confirm
+      .mutate({
+        familyId: 10,
+        medicationId: medication.id,
+        doseDate: "2026-10-28",
+        doseTime: "20:00",
+      })
+      .then(
+        () => null,
+        error => error
+      );
+    expect(getErrorCode(earlyDose)).toBe("BAD_REQUEST");
+    expect(
+      state.doseConfirmations.filter(row => row.medicationId === medication.id)
+    ).toHaveLength(1);
+    vi.setSystemTime(new Date("2026-10-29T00:00:00.000Z"));
     const duplicateDose = await owner.care.medications.confirm
       .mutate({
         familyId: 10,

@@ -31,6 +31,7 @@ import CareDialog, {
 import { canCoordinateRole, canWriteRole } from "@/lib/care-permissions";
 import { trpc } from "@/lib/trpc";
 import {
+  canConfirmDoseAt,
   dateKeyInZone,
   isValidTimeZone,
 } from "@shared/timezone";
@@ -172,6 +173,12 @@ export default function Home() {
   const [busy, setBusy] = useState(false);
   const [inviteLink, setInviteLink] = useState("");
   const [transferTargetId, setTransferTargetId] = useState<number | null>(null);
+  const [now, setNow] = useState(() => new Date());
+
+  useEffect(() => {
+    const interval = window.setInterval(() => setNow(new Date()), 15_000);
+    return () => window.clearInterval(interval);
+  }, []);
 
   const me = trpc.auth.me.useQuery();
   const isInvitationPath = path.startsWith("/invite/");
@@ -284,7 +291,6 @@ export default function Home() {
     name: member.name,
     role: member.role,
   }));
-  const now = new Date();
   const isOverdue = (task: (typeof taskRows)[number]) =>
     !!task.dueAt && new Date(task.dueAt) < now && task.status !== "completed";
   const overdueCount = taskRows.filter(isOverdue).length;
@@ -1372,6 +1378,12 @@ export default function Home() {
                           <div className="dose-list">
                             {med.doses.map(dose => {
                               const confirmation = dose.confirmation;
+                              const canConfirmNow = canConfirmDoseAt(
+                                med.doseDate,
+                                dose.time,
+                                med.timeZone,
+                                now
+                              );
                               return (
                                 <div className="dose-row" key={`${med.id}-${dose.time}`}>
                                   <div className="dose-row-copy">
@@ -1382,12 +1394,17 @@ export default function Home() {
                                         {confirmation.note ? ` · ${confirmation.note}` : ""}
                                       </span>
                                     ) : (
-                                      <span>Not confirmed for this local date</span>
+                                      <span>
+                                        {canConfirmNow
+                                          ? "Not confirmed for this local date"
+                                          : `Scheduled for ${dose.time} · confirmation opens at that local time`}
+                                      </span>
                                     )}
                                   </div>
                                   {canWrite && !confirmation && (
                                     <button
                                       className="button button-subtle small-button"
+                                      disabled={!canConfirmNow}
                                       onClick={() => setDialog({
                                         kind: "dose",
                                         medicationId: med.id,
@@ -1395,7 +1412,7 @@ export default function Home() {
                                         doseTime: dose.time,
                                       })}
                                     >
-                                      Record confirmation
+                                      {canConfirmNow ? "Record confirmation" : `Available at ${dose.time}`}
                                     </button>
                                   )}
                                 </div>

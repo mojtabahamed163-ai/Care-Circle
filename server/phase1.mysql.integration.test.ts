@@ -4,7 +4,7 @@ import { createTRPCClient, httpBatchLink } from "@trpc/client";
 import { createExpressMiddleware } from "@trpc/server/adapters/express";
 import { and, desc, eq, gt } from "drizzle-orm";
 import superjson from "superjson";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { dateKeyInZone, resolveLocalDateTime } from "../shared/timezone";
 import { COOKIE_NAME } from "../shared/const";
 import {
@@ -84,6 +84,10 @@ suite("Phase 1 against an isolated local MySQL database", () => {
     return (error as { data?: { code?: string } } | null)?.data?.code;
   }
 
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   beforeAll(async () => {
     if (!testDatabaseUrl)
       throw new Error("Set CARE_CIRCLE_TEST_DATABASE_URL to opt in.");
@@ -155,6 +159,8 @@ suite("Phase 1 against an isolated local MySQL database", () => {
   });
 
   it("verifies persistent multi-dose confirmations, IANA appointments, family isolation, and account anonymization", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-10-28T12:00:00.000Z"));
     const owner = await clientFor(0);
     const otherOwner = await clientFor(1);
     const successor = await clientFor(2);
@@ -230,6 +236,17 @@ suite("Phase 1 against an isolated local MySQL database", () => {
       doseDate: localDoseDate,
       doseTime: "08:00",
     });
+    expect(
+      await errorCode(
+        owner.care.medications.confirm.mutate({
+          familyId: familyA.id,
+          medicationId,
+          doseDate: localDoseDate,
+          doseTime: "20:00",
+        })
+      )
+    ).toBe("BAD_REQUEST");
+    vi.setSystemTime(new Date("2026-10-29T00:00:00.000Z"));
     await owner.care.medications.confirm.mutate({
       familyId: familyA.id,
       medicationId,

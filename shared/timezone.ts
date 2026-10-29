@@ -86,6 +86,39 @@ function sameParts(left: DateTimeParts, right: DateTimeParts) {
   );
 }
 
+function offsetsNearWallClock(wallClockMs: number, timeZone: string) {
+  const offsets = new Set<number>();
+  const minuteMs = 60_000;
+  for (const hours of [-48, -36, -24, -12, 0, 12, 24, 36, 48]) {
+    const sampleMs = wallClockMs + hours * 60 * minuteMs;
+    const zoned = partsAt(new Date(sampleMs), timeZone);
+    const zonedAsUtc = Date.UTC(
+      zoned.year,
+      zoned.month - 1,
+      zoned.day,
+      zoned.hour,
+      zoned.minute
+    );
+    offsets.add(zonedAsUtc - sampleMs);
+  }
+  return [...offsets];
+}
+
+function instantsForParts(parts: DateTimeParts, timeZone: string, offsets: number[]) {
+  const wallClockMs = Date.UTC(
+    parts.year,
+    parts.month - 1,
+    parts.day,
+    parts.hour,
+    parts.minute
+  );
+  return [...new Set(
+    offsets
+      .map(offset => wallClockMs - offset)
+      .filter(candidate => sameParts(partsAt(new Date(candidate), timeZone), parts))
+  )].sort((left, right) => left - right);
+}
+
 export function isValidTimeZone(timeZone: string) {
   if (!timeZone || timeZone.length > 64) return false;
   try {
@@ -116,31 +149,68 @@ export function resolveLocalDateTime(
     parts.hour,
     parts.minute
   );
-  const offsets = new Set<number>();
-  const minuteMs = 60_000;
-  for (const hours of [-48, -36, -24, -12, 0, 12, 24, 36, 48]) {
-    const sampleMs = wallClockMs + hours * 60 * minuteMs;
-    const sample = new Date(sampleMs);
-    const zoned = partsAt(sample, timeZone);
-    const zonedAsUtc = Date.UTC(
-      zoned.year,
-      zoned.month - 1,
-      zoned.day,
-      zoned.hour,
-      zoned.minute
-    );
-    offsets.add(zonedAsUtc - sampleMs);
-  }
-
-  const matches = [...offsets]
-    .map(offset => new Date(wallClockMs - offset))
-    .filter(candidate => sameParts(partsAt(candidate, timeZone), parts));
-  const uniqueMatches = [...new Set(matches.map(candidate => candidate.getTime()))];
-  if (uniqueMatches.length === 0)
+  const matches = instantsForParts(
+    parts,
+    timeZone,
+    offsetsNearWallClock(wallClockMs, timeZone)
+  );
+  if (matches.length === 0)
     return { ok: false, reason: "nonexistent_local_time" };
-  if (uniqueMatches.length > 1)
+  if (matches.length > 1)
     return { ok: false, reason: "ambiguous_local_time" };
-  return { ok: true, instant: new Date(uniqueMatches[0]) };
+  return { ok: true, instant: new Date(matches[0]!) };
+}
+
+/** Resolve a recurring wall-clock dose time. A repeated fall-back time uses
+ * its first occurrence; a skipped spring-forward time becomes due at the
+ * first real local minute after the gap, rather than being moved earlier.
+ */
+export function scheduledDoseInstant(
+  doseDate: string,
+  doseTime: string,
+  timeZone: string
+): Date | null {
+  const parts = parseLocalParts(`${doseDate}T${doseTime}`);
+  if (!parts || !isValidTimeZone(timeZone)) return null;
+  const baseMs = Date.UTC(
+    parts.year,
+    parts.month - 1,
+    parts.day,
+    parts.hour,
+    parts.minute
+  );
+  const offsets = offsetsNearWallClock(baseMs, timeZone);
+  const minuteMs = 60_000;
+  for (let shift = 0; shift <= 24 * 60; shift += 1) {
+    const wallClock = new Date(baseMs + shift * minuteMs);
+    const shiftedParts = {
+      year: wallClock.getUTCFullYear(),
+      month: wallClock.getUTCMonth() + 1,
+      day: wallClock.getUTCDate(),
+      hour: wallClock.getUTCHours(),
+      minute: wallClock.getUTCMinutes(),
+    };
+    const matches = instantsForParts(shiftedParts, timeZone, offsets);
+    if (matches.length) return new Date(matches[0]!);
+  }
+  return null;
+}
+
+/** True only on the medication's current local date and once its scheduled
+ * instant has arrived. Legacy once-daily records have no specified clock time.
+ */
+export function canConfirmDoseAt(
+  doseDate: string,
+  doseTime: string,
+  timeZone: string,
+  now: Date
+) {
+  if (!Number.isFinite(now.getTime()) || !isValidTimeZone(timeZone)) return false;
+  if (dateKeyInZone(now, timeZone) !== doseDate) return false;
+  if (doseTime === "once") return true;
+  if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(doseTime)) return false;
+  const scheduledAt = scheduledDoseInstant(doseDate, doseTime, timeZone);
+  return !!scheduledAt && now.getTime() >= scheduledAt.getTime();
 }
 
 export function formatLocalDateTimeInZone(instant: Date, timeZone: string) {
