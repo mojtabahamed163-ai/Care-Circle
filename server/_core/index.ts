@@ -6,6 +6,7 @@ import { registerOAuthRoutes } from "./oauth";
 import { publicPlatformScript } from "./publicConfig";
 import { appRouter } from "../routers";
 import { createContext } from "./context";
+import { reconcileDueDoseNotifications } from "../care-db";
 import { serveStatic, setupVite } from "./vite";
 
 async function startServer() {
@@ -37,7 +38,14 @@ async function startServer() {
   const port = Number(process.env.PORT || "3000");
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("Invalid PORT");
   server.on("error", error => { console.error("Server failed:", error.message); process.exit(1); });
-  server.listen(port, "0.0.0.0", () => console.log(`Server listening on port ${port}`));
+  server.listen(port, "0.0.0.0", () => {
+    console.log(`Server listening on port ${port}`);
+    // Best-effort in-process DB reconciliation only; no email, push, or other outbound calls.
+    const reconcile = () => void reconcileDueDoseNotifications().catch(error => console.error("[InAppNotifications] Reconciliation failed:", error instanceof Error ? error.message : "unknown error"));
+    reconcile();
+    const timer = setInterval(reconcile, 30_000);
+    timer.unref();
+  });
 }
 
 startServer().catch(error => { console.error(error); process.exit(1); });

@@ -2430,3 +2430,227 @@ textarea:focus-visible {
     flex-direction: column;
   }
 }
+
+/* Shared household lists */
+.shared-record-list {
+  display: flex;
+  flex-direction: column;
+}
+.shared-record {
+  border-bottom: 1px solid var(--cc-line);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 16px 2px;
+  min-width: 0;
+}
+.shared-record:last-child {
+  border-bottom: 0;
+}
+.shared-record.record-complete .record-copy h3 {
+  color: #88948a;
+  text-decoration: line-through;
+}
+.record-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.record-copy h3 {
+  color: var(--cc-ink);
+  margin: 0;
+  font-size: 14px;
+  font-weight: 650;
+  overflow-wrap: anywhere;
+}
+.record-copy p,
+.record-copy small,
+.record-copy a {
+  color: #77837a;
+  margin: 0;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.record-copy a {
+  color: var(--cc-green-dark);
+  text-decoration: underline;
+}
+.record-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 9px;
+  flex: none;
+}
+.contact-kind {
+  color: var(--cc-green);
+  font-size: 9px;
+  font-weight: 750;
+  letter-spacing: 0.1em;
+}
+.shared-form {
+  background: #fafbf8;
+  border: 1px solid #e7ebe4;
+  border-radius: 12px;
+  margin-top: 18px;
+  padding: 17px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+.shared-form h3 {
+  grid-column: 1 / -1;
+  color: var(--cc-green-dark);
+  margin: 0 0 2px;
+  font-size: 15px;
+}
+.shared-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  color: #68746c;
+  font-size: 11px;
+  font-weight: 600;
+  min-width: 0;
+}
+.shared-form input,
+.shared-form select,
+.shared-form textarea {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 39px;
+  border: 1px solid #dfe5dc;
+  border-radius: 8px;
+  background: white;
+  color: var(--cc-ink);
+  padding: 9px 10px;
+  font: inherit;
+  font-weight: 400;
+}
+.shared-form textarea {
+  resize: vertical;
+}
+.shared-form .form-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.data-error {
+  color: #9a4c37;
+  background: #fff7f3;
+  border-radius: 8px;
+  margin: 12px 0;
+  padding: 13px;
+  font-size: 12px;
+}
+.emergency-disclaimer {
+  margin: 8px 0 15px;
+}
+.priority-pill {
+  display: inline-flex;
+  align-self: flex-start;
+  background: #f0f3ee;
+  border-radius: 99px;
+  color: #637166;
+  padding: 4px 8px;
+  font-size: 9px;
+  line-height: 1.2;
+  text-transform: capitalize;
+}
+.priority-pill.priority-high {
+  background: #faeee9;
+  color: #95553d;
+}
+.priority-pill.priority-medium {
+  background: #f7f1e6;
+  color: #806345;
+}
+.priority-pill.priority-low {
+  background: #edf4ed;
+  color: #577660;
+}
+@media (max-width: 680px) {
+  .shared-record {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 10px;
+    padding: 14px 0;
+  }
+  .record-actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+  .shared-form {
+    grid-template-columns: 1fr;
+    padding: 14px;
+  }
+  .shared-form h3,
+  .shared-form .form-actions {
+    grid-column: 1;
+  }
+  .shared-form .form-actions {
+    flex-wrap: wrap;
+  }
+  .emergency-disclaimer {
+    padding: 10px;
+  }
+}
+
+.phase2-stack { display: grid; gap: 14px; margin-top: 18px; }
+.phase2-panel { margin-top: 14px; }
+.phase2-panel h2 { margin: 0 0 5px; color: #31433a; font: 500 18px Georgia, serif; }
+.phase2-inline-form { display: grid; grid-template-columns: repeat(3, minmax(130px, 1fr)) auto; gap: 10px; align-items: end; margin: 14px 0; }
+.phase2-inline-form label, .phase2-handoff-form > label { display: grid; gap: 6px; color: #68766d; font-size: 11px; }
+.phase2-inline-form input, .phase2-inline-form select, .phase2-handoff-form input, .phase2-handoff-form select, .phase2-handoff-form textarea { width: 100%; min-height: 38px; border: 1px solid #dfe6df; border-radius: 7px; padding: 8px 10px; color: #33443b; background: #fff; }
+.phase2-record { display: flex; justify-content: space-between; align-items: flex-start; gap: 14px; padding: 12px 0; border-top: 1px solid #edf0eb; color: #59665e; font-size: 12px; }
+.phase2-record strong { color: #34453c; }
+.phase2-record p { margin: 5px 0; line-height: 1.5; }
+.phase2-record small { color: #89948c; line-height: 1.5; }
+.phase2-empty, .phase2-history { padding: 9px 0; color: #849087; font-size: 11px; }
+.phase2-history { border-top: 1px solid #f0f2ee; }
+.audit-record pre { max-width: 100%; overflow: auto; padding: 10px; border-radius: 6px; background: #f7f8f5; font-size: 10px; }
+.audit-record details { margin-top: 7px; }
+.phase2-handoff-form { display: grid; gap: 13px; margin: 14px 0; }
+.phase2-handoff-form fieldset { display: flex; flex-wrap: wrap; gap: 8px 16px; border: 1px solid #e7ebe5; border-radius: 8px; padding: 12px; }
+.phase2-handoff-form legend { padding: 0 5px; color: #68766d; font-size: 11px; }
+.phase2-checkbox { display: inline-flex; align-items: center; gap: 7px; color: #526158; font-size: 11px; }
+.phase2-checkbox input { width: auto; min-height: 0; }
+@media (max-width: 760px) { .phase2-inline-form { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 480px) { .phase2-inline-form { grid-template-columns: 1fr; } .phase2-record { flex-direction: column; } }
+
+.phase3-panel { margin-top: 18px; }
+.phase3-heading { display: flex; justify-content: space-between; align-items: flex-end; gap: 18px; margin-bottom: 16px; }
+.phase3-heading h2 { margin: 4px 0; color: #31433a; font: 500 20px Georgia, serif; }
+.phase3-heading p, .phase3-caption, .phase3-footer p { margin: 4px 0; color: #77837a; font-size: 11px; line-height: 1.5; }
+.phase3-dates { display: flex; gap: 8px; }
+.phase3-dates label { display: grid; gap: 5px; color: #68766d; font-size: 10px; }
+.phase3-dates input { min-width: 140px; border: 1px solid #dfe6df; border-radius: 7px; padding: 8px; color: #34453c; background: #fff; }
+.phase3-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.phase3-card { min-width: 0; border: 1px solid #e9eee8; border-radius: 10px; padding: 14px; background: #fff; }
+.phase3-card h3 { margin: 0; color: #34453c; font-size: 13px; }
+.phase3-card h4 { margin: 12px 0 4px; color: #34453c; font-size: 11px; }
+.phase3-table-wrap { overflow-x: auto; margin-top: 10px; }
+.phase3-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+.phase3-table th, .phase3-table td { padding: 8px 6px; border-bottom: 1px solid #eef1ed; text-align: left; white-space: nowrap; }
+.phase3-table thead { color: #78847c; font-size: 10px; }
+.phase3-table tbody th { color: #35463d; font-weight: 600; }
+.phase3-caveat { margin: 10px 0 0; color: #79857d; font-size: 10px; line-height: 1.5; }
+.phase3-state { padding: 8px 0; color: #869188; font-size: 11px; }
+.phase3-error { color: #a14d42; font-size: 11px; line-height: 1.45; }
+.phase3-counts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; margin: 12px 0; }
+.phase3-counts div { border-radius: 7px; padding: 9px; background: #f5f7f3; }
+.phase3-counts dt { color: #77837a; font-size: 10px; }
+.phase3-counts dd { margin: 3px 0 0; color: #33463b; font-size: 17px; font-weight: 600; }
+.phase3-events { display: grid; gap: 5px; margin: 7px 0; padding-left: 17px; color: #5c6b61; font-size: 11px; }
+.phase3-footer { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px; border-top: 1px solid #edf0eb; padding-top: 12px; }
+.phase3-toggle { display: inline-flex; align-items: center; gap: 7px; margin-top: 5px; color: #526158; font-size: 11px; }
+.phase3-toggle input { width: auto; min-height: 0; accent-color: #617d68; }
+.phase3-plan { border-radius: 8px; padding: 11px; background: #f5f7f3; color: #526158; font-size: 11px; }
+.phase3-plan strong { color: #35463d; }
+.phase3-plan small { color: #77837a; line-height: 1.5; }
+@media (max-width: 720px) { .phase3-heading { align-items: stretch; flex-direction: column; } .phase3-grid, .phase3-footer { grid-template-columns: 1fr; } .phase3-dates input { min-width: 0; width: 100%; } .phase3-dates label { flex: 1; } }
+@media (max-width: 420px) { .phase3-table th, .phase3-table td { padding: 7px 4px; font-size: 10px; } .phase3-panel { padding: 13px; } }

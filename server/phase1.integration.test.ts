@@ -176,6 +176,40 @@ function makeInitialState(): TableState {
         createdAt: old,
       },
     ],
+    householdNeeds: [
+      {
+        id: 401,
+        familyId: 20,
+        name: "Bravo private item",
+        quantity: null,
+        priority: "low",
+        buyerId: 2,
+        completed: false,
+        createdBy: 2,
+        createdAt: old,
+        updatedAt: old,
+      },
+    ],
+    importantContacts: [
+      {
+        id: 402,
+        familyId: 20,
+        kind: "family",
+        name: "Bravo private contact",
+        organization: null,
+        phone: null,
+        email: null,
+        notes: null,
+        createdBy: 2,
+        createdAt: old,
+        updatedAt: old,
+      },
+    ],
+    careDigestPreferences: [],
+    taskCollaborationRequests: [],
+    careAbsences: [],
+    careAuditLog: [],
+    careHandoffs: [],
   };
 }
 
@@ -188,17 +222,28 @@ function sameValue(left: unknown, right: unknown) {
 function matchingRows(rows: Row[], tableName: string, condition?: SQL): Row[] {
   if (!condition) return rows;
   const { sql, params } = dialect.sqlToQuery(condition);
-  const predicates = [...sql.matchAll(/`([^`]+)`\.`([^`]+)` = \?/g)];
-  return rows.filter(row => {
-    let paramIndex = 0;
-    for (const predicate of predicates) {
-      const [, referencedTable, column] = predicate;
-      const value = params[paramIndex++];
-      if (referencedTable !== tableName || !(column in row)) continue;
-      if (!sameValue(row[column], value)) return false;
+  const normalized = sql.replace(/[()]/g, "");
+  const branches = normalized.split(/\s+or\s+/i);
+  const groups: Array<Array<{ table: string; column: string; op: string; value: unknown }>> = [];
+  let index = 0;
+  for (const branch of branches) {
+    const terms: Array<{ table: string; column: string; op: string; value: unknown }> = [];
+    for (const match of branch.matchAll(/`([^`]+)`\.`([^`]+)`\s*(=|>=|<=|>|<)\s*\?/g)) {
+      terms.push({ table: match[1]!, column: match[2]!, op: match[3]!, value: params[index++] });
     }
-    return true;
-  });
+    groups.push(terms);
+  }
+  return rows.filter(row => groups.some(terms => terms.every(({ table, column, op, value }) => {
+    if (table !== tableName || !(column in row)) return true;
+    const actual = row[column];
+    const left = actual instanceof Date ? actual.getTime() : actual;
+    const right = actual instanceof Date ? (value instanceof Date ? value.getTime() : new Date(`${String(value).replace(" ", "T")}Z`).getTime()) : value instanceof Date ? value.getTime() : value;
+    if (op === "=") return sameValue(actual, value) || (actual instanceof Date && left === right);
+    if (op === ">=") return left >= right;
+    if (op === "<=") return left <= right;
+    if (op === ">") return left > right;
+    return left < right;
+  })));
 }
 
 function joinRows(
@@ -221,7 +266,9 @@ function joinRows(
                 ? row.escortId
                 : tableName === "careNotes"
                   ? row.createdBy
-                  : row.assigneeId;
+                  : tableName === "householdNeeds"
+                    ? row.buyerId
+                    : row.assigneeId;
       const user = state.users.find(candidate => candidate.id === userId);
       if (tableName === "familyMembers") {
         result.name = user?.name ?? null;
@@ -234,6 +281,8 @@ function joinRows(
         result.escortName = user?.name ?? null;
       } else if (tableName === "careNotes") {
         result.authorName = user?.name ?? null;
+      } else if (tableName === "householdNeeds") {
+        result.buyerName = user?.name ?? null;
       } else if (tableName === "careTasks") {
         result.assigneeName = user?.name ?? null;
       }
@@ -853,6 +902,247 @@ describe("phase 1 HTTP integration with isolated in-memory MySQL-shaped test dou
     });
   });
 
+  it("creates, reads, updates, and deletes needs and contacts with family and viewer isolation", async () => {
+    state.familyMembers.push({
+      id: 103,
+      familyId: 10,
+      userId: 3,
+      role: "viewer",
+      joinedAt: fixedNow,
+    });
+    const owner = clientFor(1);
+    const viewer = clientFor(3);
+
+    const need = await owner.care.householdNeeds.create.mutate({
+      familyId: 10,
+      name: "  Pantry staples  ",
+      quantity: "2 bags",
+      priority: "high",
+      buyerId: 1,
+    });
+    expect(need.id).toBeGreaterThan(0);
+    expect(state.householdNeeds.find(row => row.id === need.id)).toMatchObject({
+      familyId: 10,
+      name: "Pantry staples",
+      quantity: "2 bags",
+      buyerId: 1,
+      createdBy: 1,
+    });
+    expect(
+      await owner.care.householdNeeds.list.query({ familyId: 10 })
+    ).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: need.id,
+          name: "Pantry staples",
+          buyerName: "Alex One",
+        }),
+      ])
+    );
+    await owner.care.householdNeeds.update.mutate({
+      familyId: 10,
+      needId: need.id,
+      name: "Pantry staples",
+      quantity: "3 bags",
+      priority: "medium",
+      buyerId: 1,
+      completed: true,
+    });
+    expect(state.householdNeeds.find(row => row.id === need.id)).toMatchObject({
+      quantity: "3 bags",
+      completed: true,
+    });
+    expect(
+      await viewer.care.householdNeeds.list.query({ familyId: 10 })
+    ).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: need.id })])
+    );
+    const assignedNeed = await owner.care.householdNeeds.create.mutate({
+      familyId: 10,
+      name: "Former buyer test",
+      priority: "low",
+      buyerId: 3,
+    });
+    const viewerMembership = state.familyMembers.find(
+      row => row.familyId === 10 && row.userId === 3
+    )!;
+    state.familyMembers = state.familyMembers.filter(
+      row => row.id !== viewerMembership.id
+    );
+    expect(
+      await owner.care.householdNeeds.list.query({ familyId: 10 })
+    ).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: assignedNeed.id,
+          buyerId: null,
+          buyerName: null,
+        }),
+      ])
+    );
+    state.familyMembers.push(viewerMembership);
+    await owner.care.householdNeeds.delete.mutate({
+      familyId: 10,
+      needId: assignedNeed.id,
+    });
+    expect(
+      getErrorCode(
+        await viewer.care.householdNeeds.update
+          .mutate({
+            familyId: 10,
+            needId: need.id,
+            name: "Viewer change",
+            priority: "low",
+            completed: false,
+          })
+          .then(
+            () => null,
+            error => error
+          )
+      )
+    ).toBe("FORBIDDEN");
+    expect(
+      getErrorCode(
+        await owner.care.householdNeeds.create
+          .mutate({
+            familyId: 10,
+            name: "Invalid buyer",
+            priority: "low",
+            buyerId: 2,
+          })
+          .then(
+            () => null,
+            error => error
+          )
+      )
+    ).toBe("BAD_REQUEST");
+    expect(
+      getErrorCode(
+        await owner.care.householdNeeds.update
+          .mutate({
+            familyId: 10,
+            needId: 401,
+            name: "ID swap",
+            priority: "low",
+            completed: false,
+          })
+          .then(
+            () => null,
+            error => error
+          )
+      )
+    ).toBe("NOT_FOUND");
+    expect(
+      getErrorCode(
+        await owner.care.householdNeeds.delete
+          .mutate({ familyId: 10, needId: 401 })
+          .then(
+            () => null,
+            error => error
+          )
+      )
+    ).toBe("NOT_FOUND");
+    expect(
+      getErrorCode(
+        await owner.care.householdNeeds.list.query({ familyId: 20 }).then(
+          () => null,
+          error => error
+        )
+      )
+    ).toBe("FORBIDDEN");
+    await owner.care.householdNeeds.delete.mutate({
+      familyId: 10,
+      needId: need.id,
+    });
+    expect(state.householdNeeds.some(row => row.id === need.id)).toBe(false);
+
+    const contact = await owner.care.importantContacts.create.mutate({
+      familyId: 10,
+      kind: "emergency",
+      name: "Family-selected contact",
+      phone: "+1-555-0100",
+      notes: "Call if unavailable",
+    });
+    expect(
+      await owner.care.importantContacts.list.query({ familyId: 10 })
+    ).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: contact.id,
+          kind: "emergency",
+          phone: "+1-555-0100",
+        }),
+      ])
+    );
+    expect(
+      await viewer.care.importantContacts.list.query({ familyId: 10 })
+    ).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: contact.id })])
+    );
+    await owner.care.importantContacts.update.mutate({
+      familyId: 10,
+      contactId: contact.id,
+      kind: "clinic",
+      name: "Updated clinic",
+      email: "clinic@example.test",
+    });
+    expect(
+      state.importantContacts.find(row => row.id === contact.id)
+    ).toMatchObject({ kind: "clinic", name: "Updated clinic" });
+    expect(
+      getErrorCode(
+        await viewer.care.importantContacts.delete
+          .mutate({ familyId: 10, contactId: contact.id })
+          .then(
+            () => null,
+            error => error
+          )
+      )
+    ).toBe("FORBIDDEN");
+    expect(
+      getErrorCode(
+        await owner.care.importantContacts.delete
+          .mutate({ familyId: 10, contactId: 402 })
+          .then(
+            () => null,
+            error => error
+          )
+      )
+    ).toBe("NOT_FOUND");
+    expect(
+      getErrorCode(
+        await owner.care.importantContacts.update
+          .mutate({
+            familyId: 10,
+            contactId: 402,
+            kind: "family",
+            name: "ID swap",
+          })
+          .then(
+            () => null,
+            error => error
+          )
+      )
+    ).toBe("NOT_FOUND");
+    expect(
+      getErrorCode(
+        await owner.care.importantContacts.list.query({ familyId: 20 }).then(
+          () => null,
+          error => error
+        )
+      )
+    ).toBe("FORBIDDEN");
+    await owner.care.importantContacts.delete.mutate({
+      familyId: 10,
+      contactId: contact.id,
+    });
+    expect(state.importantContacts.some(row => row.id === contact.id)).toBe(
+      false
+    );
+    expect(state.importantContacts.find(row => row.id === 402)?.name).toBe(
+      "Bravo private contact"
+    );
+  });
   it("creates a family, enforces email-bound invitations and roles, transfers ownership, and permits the former owner to leave", async () => {
     const owner = clientFor(1);
     const created = await owner.care.families.create.mutate({
@@ -1088,8 +1378,8 @@ describe("phase 1 HTTP integration with isolated in-memory MySQL-shaped test dou
     const ownerEvent = state.careEvents.find(
       row => row.title === "Owner-created appointment"
     )!;
-    const caregiverEventEdit = await clientFor(3).care.events.update
-      .mutate({
+    const caregiverEventEdit = await clientFor(3)
+      .care.events.update.mutate({
         familyId: created.id,
         eventId: ownerEvent.id,
         title: "Unauthorized event edit",
@@ -1103,8 +1393,11 @@ describe("phase 1 HTTP integration with isolated in-memory MySQL-shaped test dou
         error => error
       );
     expect(getErrorCode(caregiverEventEdit)).toBe("FORBIDDEN");
-    const caregiverEventDelete = await clientFor(3).care.events.delete
-      .mutate({ familyId: created.id, eventId: ownerEvent.id })
+    const caregiverEventDelete = await clientFor(3)
+      .care.events.delete.mutate({
+        familyId: created.id,
+        eventId: ownerEvent.id,
+      })
       .then(
         () => null,
         error => error
@@ -1403,9 +1696,16 @@ describe("phase 1 HTTP integration with isolated in-memory MySQL-shaped test dou
       timeZone: "America/Chicago",
       reminderMinutes: 0,
     });
-    const temporaryEvent = state.careEvents.find(row => row.title === "Temporary event")!;
-    await owner.care.events.delete.mutate({ familyId: 10, eventId: temporaryEvent.id });
-    expect(state.careEvents.some(row => row.id === temporaryEvent.id)).toBe(false);
+    const temporaryEvent = state.careEvents.find(
+      row => row.title === "Temporary event"
+    )!;
+    await owner.care.events.delete.mutate({
+      familyId: 10,
+      eventId: temporaryEvent.id,
+    });
+    expect(state.careEvents.some(row => row.id === temporaryEvent.id)).toBe(
+      false
+    );
     await owner.care.notes.create.mutate({
       familyId: 10,
       kind: "handoff",
@@ -1416,7 +1716,9 @@ describe("phase 1 HTTP integration with isolated in-memory MySQL-shaped test dou
     const tasks = await owner.care.tasks.list.query({ familyId: 10 });
     expect(tasks[0]?.completionHistory).toHaveLength(2);
     expect(tasks[0]?.completionHistory[0]?.completedByName).toBe("Alex One");
-    const medications = await owner.care.medications.list.query({ familyId: 10 });
+    const medications = await owner.care.medications.list.query({
+      familyId: 10,
+    });
     expect(medications[0]?.doses).toHaveLength(2);
     expect(medications[0]?.doses[0]?.confirmation?.status).toBe("confirmed");
     expect(medications[0]?.doses[1]?.confirmation?.status).toBe("confirmed");
@@ -1770,31 +2072,181 @@ describe("phase 1 HTTP integration with isolated in-memory MySQL-shaped test dou
       success: true,
       sharedHistoryRetained: true,
     });
-    const former = state.users.find(user => user.name === "Former family member")!;
+    const former = state.users.find(
+      user => user.name === "Former family member"
+    )!;
     expect(state.users.some(user => user.id === 1)).toBe(false);
     expect(former.email).toBeNull();
     expect(former.openId).not.toBe("test-open-id-1");
     expect(state.familyMembers.some(member => member.userId === 1)).toBe(false);
-    expect(state.families.find(family => family.id === 10)?.createdBy).toBe(former.id);
+    expect(state.families.find(family => family.id === 10)?.createdBy).toBe(
+      former.id
+    );
     expect(state.careTasks.find(task => task.id === 302)).toMatchObject({
       createdBy: former.id,
       completedBy: former.id,
       assigneeId: null,
     });
-    expect(state.careTaskCompletions.find(row => row.id === 303)?.completedBy).toBe(former.id);
+    expect(
+      state.careTaskCompletions.find(row => row.id === 303)?.completedBy
+    ).toBe(former.id);
     expect(state.medications.find(row => row.id === 304)).toMatchObject({
       createdBy: former.id,
       assigneeId: null,
     });
-    expect(state.doseConfirmations.find(row => row.id === 305)?.confirmedBy).toBe(former.id);
+    expect(
+      state.doseConfirmations.find(row => row.id === 305)?.confirmedBy
+    ).toBe(former.id);
     expect(state.careEvents.find(row => row.id === 306)).toMatchObject({
       createdBy: former.id,
       escortId: null,
     });
-    expect(state.careNotes.find(row => row.id === 307)?.createdBy).toBe(former.id);
+    expect(state.careNotes.find(row => row.id === 307)?.createdBy).toBe(
+      former.id
+    );
     expect(state.familyInvitations.find(row => row.id === 308)).toMatchObject({
       invitedBy: former.id,
       status: "revoked",
     });
+  });
+
+  it("enforces family membership and viewer write limits for collaboration and absence APIs", async () => {
+    const outsider = clientFor(1);
+    const crossFamily = await outsider.care.collaboration.request.mutate({ familyId: 20, taskId: 200, targetId: 3, kind: "help" }).then(() => null, error => error);
+    expect(getErrorCode(crossFamily)).toBe("FORBIDDEN");
+    const crossFamilyTarget = await clientFor(2).care.collaboration.request.mutate({ familyId: 20, taskId: 200, targetId: 1, kind: "help" }).then(() => null, error => error);
+    expect(getErrorCode(crossFamilyTarget)).toBe("BAD_REQUEST");
+    state.familyMembers.find(member => member.userId === 3 && member.familyId === 20)!.role = "viewer";
+    const viewer = await clientFor(3).care.collaboration.request.mutate({ familyId: 20, taskId: 200, targetId: 2, kind: "help" }).then(() => null, error => error);
+    expect(getErrorCode(viewer)).toBe("FORBIDDEN");
+    const outsiderAbsence = await outsider.care.absences.create.mutate({ familyId: 20, memberId: 2, startDate: "2026-11-01", endDate: "2026-11-02" }).then(() => null, error => error);
+    expect(getErrorCode(outsiderAbsence)).toBe("FORBIDDEN");
+    expect(state.taskCollaborationRequests ?? []).toHaveLength(0);
+  });
+
+  it("publishes one help request, rejects duplicates, and accepts only once", async () => {
+    const owner = clientFor(2);
+    const recipient = clientFor(3);
+    const created = await owner.care.collaboration.request.mutate({ familyId: 20, taskId: 200, targetId: 3, kind: "help" });
+    expect(created.requestId).toBeGreaterThan(0);
+    const duplicate = await owner.care.collaboration.request.mutate({ familyId: 20, taskId: 200, targetId: 3, kind: "help" }).then(() => null, error => error);
+    expect(getErrorCode(duplicate)).toBe("CONFLICT");
+    expect(state.careTasks.find(task => task.id === 200)?.assigneeId).toBe(2);
+    await expect(recipient.care.collaboration.respond.mutate({ familyId: 20, requestId: created.requestId, accept: true })).resolves.toMatchObject({ accepted: true });
+    expect(state.careTasks.find(task => task.id === 200)?.assigneeId).toBe(3);
+    const secondAccept = await recipient.care.collaboration.respond.mutate({ familyId: 20, requestId: created.requestId, accept: true }).then(() => null, error => error);
+    expect(getErrorCode(secondAccept)).toBe("CONFLICT");
+    expect(state.careTasks.find(task => task.id === 200)?.assigneeId).toBe(3);
+  });
+
+  it("does not apply a responsibility swap before explicit recipient acceptance", async () => {
+    const requester = clientFor(2);
+    const recipient = clientFor(3);
+    const created = await requester.care.collaboration.request.mutate({ familyId: 20, taskId: 200, targetId: 3, kind: "swap" });
+    expect(state.careTasks.find(task => task.id === 200)?.assigneeId).toBe(2);
+    expect(state.taskCollaborationRequests?.[0]?.status).toBe("pending");
+    await recipient.care.collaboration.respond.mutate({ familyId: 20, requestId: created.requestId, accept: true });
+    expect(state.careTasks.find(task => task.id === 200)?.assigneeId).toBe(3);
+  });
+
+  it("rejects a response when the task changed after a request was made", async () => {
+    const requester = clientFor(2);
+    const recipient = clientFor(3);
+    const created = await requester.care.collaboration.request.mutate({ familyId: 20, taskId: 200, targetId: 3, kind: "help" });
+    await requester.care.tasks.update.mutate({ familyId: 20, taskId: 200, title: "Changed while waiting", priority: "high", recurrence: "none", status: "in_progress" });
+    const response = await recipient.care.collaboration.respond.mutate({ familyId: 20, requestId: created.requestId, accept: true }).then(() => null, error => error);
+    expect(getErrorCode(response)).toBe("CONFLICT");
+    expect(state.careTasks.find(task => task.id === 200)?.assigneeId).toBe(2);
+  });
+
+  it("records absences without reassigning tasks and exposes audit as read-only", async () => {
+    const owner = clientFor(2);
+    await owner.care.absences.create.mutate({ familyId: 20, memberId: 2, startDate: "2026-10-29", endDate: "2026-10-30", note: "Away" });
+    expect(state.careTasks.find(task => task.id === 200)?.assigneeId).toBe(2);
+    const rows = await owner.care.absences.list.query({ familyId: 20 });
+    expect(rows[0].affectedTasks.map(task => task.id)).toContain(200);
+    await owner.care.families.changeRole.mutate({ familyId: 20, memberId: 202, role: "viewer" });
+    await owner.care.events.update.mutate({ familyId: 20, eventId: 230, title: "Updated visit audit", kind: "appointment", startsAtLocal: "2026-10-29T10:00", timeZone: "America/New_York", reminderMinutes: 30 });
+    const logRows = await owner.care.audit.list.query({ familyId: 20 });
+    expect(logRows.some(row => row.action === "absence.recorded" && row.actorId === 2 && row.newValues?.startDate === "2026-10-29")).toBe(true);
+    expect(logRows.some(row => row.action === "role.changed" && row.previousValues?.role === "caregiver" && row.newValues?.role === "viewer")).toBe(true);
+    expect(logRows.some(row => row.action === "event.updated" && row.previousValues?.title === "Private appointment" && row.newValues?.title === "Updated visit audit")).toBe(true);
+    const noUpdateRoute = await fetch(`${endpoint}/care.audit.update?batch=1&input=${encodeURIComponent(JSON.stringify({ "0": { json: { familyId: 20, id: 1 } } }))}`);
+    expect(noUpdateRoute.status).toBeGreaterThanOrEqual(400);
+    const noDeleteRoute = await fetch(`${endpoint}/care.audit.delete?batch=1&input=${encodeURIComponent(JSON.stringify({ "0": { json: { familyId: 20, id: 1 } } }))}`);
+    expect(noDeleteRoute.status).toBeGreaterThanOrEqual(400);
+    expect("update" in (clientFor(2).care.audit as unknown as Record<string, unknown>)).toBe(false);
+  });
+
+
+  it("creates a post-visit handoff for one family recipient with pending task context", async () => {
+    const visitAt = new Date("2026-10-30T10:00:00.000Z");
+    state.careEvents.push({ id: 231, familyId: 20, title: "Follow-up visit", kind: "visit", startsAt: visitAt, timeZone: "UTC", location: null, escortId: 2, reminderMinutes: 0, questions: null, visitNotes: null, createdBy: 2, createdAt: fixedNow, updatedAt: fixedNow });
+    const owner = clientFor(2);
+    await owner.care.handoffs.create.mutate({ familyId: 20, eventId: 231, recipientId: 3, context: "Follow up with the family about next steps.", pendingTaskIds: [200] });
+    const rows = await owner.care.handoffs.list.query({ familyId: 20 });
+    expect(rows[0]).toMatchObject({ recipientId: 3, eventId: 231, context: "Follow up with the family about next steps." });
+    expect(rows[0].pendingTasks.map(task => task.id)).toContain(200);
+  });
+
+  it("scopes workload reports, permits viewer reads, and rejects viewer writes", async () => {
+    state.careTasks.push(
+      { id: 210, familyId: 20, title: "Done", dueAt: null, completedAt: new Date("2026-10-28T10:00:00Z"), assigneeId: 3, status: "completed", estimatedMinutes: 25, createdBy: 2, recurrence: "none" },
+      { id: 211, familyId: 20, title: "Unassigned late", dueAt: new Date("2026-10-27T10:00:00Z"), completedAt: null, assigneeId: null, status: "new", createdBy: 2, recurrence: "none" },
+      { id: 212, familyId: 10, title: "Other family only", dueAt: new Date("2026-10-29T10:00:00Z"), completedAt: null, assigneeId: 1, status: "new", createdBy: 1, recurrence: "none" },
+    );
+    const report = await clientFor(2).care.phase3.workload.query({ familyId: 20, startDate: "2026-10-27", endDate: "2026-11-02" });
+    expect(report.members.find(row => row.userId === 3)).toMatchObject({ completed: 1, estimatedMinutesTotal: 25 });
+    expect(report.members.find(row => row.userId === null)?.overdue).toBe(1);
+    expect(JSON.stringify(report)).not.toContain("Other family only");
+    expect(report.caveat).toContain("No one is scored, ranked, or judged");
+    expect(getErrorCode(await clientFor(1).care.phase3.workload.query({ familyId: 20, startDate: "2026-10-27", endDate: "2026-11-02" }).then(() => null, e => e))).toBe("FORBIDDEN");
+    state.familyMembers.find(row => row.familyId === 20 && row.userId === 3)!.role = "viewer";
+    await expect(clientFor(3).care.phase3.workload.query({ familyId: 20, startDate: "2026-10-27", endDate: "2026-11-02" })).resolves.toBeTruthy();
+    expect(getErrorCode(await clientFor(3).care.tasks.create.mutate({ familyId: 20, title: "No", priority: "low", recurrence: "none" }).then(() => null, e => e))).toBe("FORBIDDEN");
+  });
+
+  it("rejects invalid dates and out-of-range estimated minutes", async () => {
+    const owner = clientFor(2);
+    expect(getErrorCode(await owner.care.phase3.workload.query({ familyId: 20, startDate: "2026-11-02", endDate: "2026-10-27" }).then(() => null, e => e))).toBe("BAD_REQUEST");
+    expect(getErrorCode(await owner.care.phase3.weeklySummary.query({ familyId: 20, startDate: "2026-10-01", endDate: "2026-10-10" }).then(() => null, e => e))).toBe("BAD_REQUEST");
+    expect(getErrorCode(await owner.care.tasks.create.mutate({ familyId: 20, title: "Bad estimate", priority: "low", recurrence: "none", estimatedMinutes: 1441 }).then(() => null, e => e))).toBe("BAD_REQUEST");
+    await expect(owner.care.tasks.create.mutate({ familyId: 20, title: "Estimate", priority: "low", recurrence: "none", estimatedMinutes: 60 })).resolves.toMatchObject({ success: true });
+    expect(state.careTasks.find(row => row.title === "Estimate")?.estimatedMinutes).toBe(60);
+  });
+
+  it("keeps notification preferences and inbox actions scoped to current family membership", async () => {
+    const outsider = clientFor(1);
+    const prefs = await outsider.care.phase3.notificationPreferences.query({ familyId: 20 }).then(() => null, error => error);
+    const inbox = await outsider.care.phase3.inbox.query({ familyId: 20 }).then(() => null, error => error);
+    const markRead = await outsider.care.phase3.markNotificationRead.mutate({ familyId: 20, notificationId: 1 }).then(() => null, error => error);
+    expect(getErrorCode(prefs)).toBe("FORBIDDEN");
+    expect(getErrorCode(inbox)).toBe("FORBIDDEN");
+    expect(getErrorCode(markRead)).toBe("FORBIDDEN");
+  });
+
+  it("persists digest opt-out and excludes notes and medication details from summaries", async () => {
+    state.taskCollaborationRequests.push({ id: 1, familyId: 20, taskId: 200, kind: "help", requesterId: 2, targetId: 3, status: "pending", createdAt: new Date("2026-10-28T11:00:00Z"), taskSnapshot: {} });
+    const owner = clientFor(2);
+    await expect(owner.care.phase3.digestPreference.query({ familyId: 20 })).resolves.toMatchObject({ enabled: false, deliveryConfigured: false });
+    await owner.care.phase3.setDigestPreference.mutate({ familyId: 20, enabled: true });
+    await owner.care.phase3.setDigestPreference.mutate({ familyId: 20, enabled: false });
+    await expect(owner.care.phase3.digestPreference.query({ familyId: 20 })).resolves.toMatchObject({ enabled: false, kind: "preference_only" });
+    await expect(clientFor(3).care.phase3.digestPreference.query({ familyId: 20 })).resolves.toMatchObject({ enabled: false });
+    const summary = await owner.care.phase3.weeklySummary.query({ familyId: 20, startDate: "2026-10-27", endDate: "2026-11-02" });
+    expect(summary.pendingHelpRequests).toBe(1);
+    expect(summary.events).toHaveLength(1);
+    expect(JSON.stringify(summary)).not.toContain("Private journal entry");
+    expect(JSON.stringify(summary)).not.toContain("Private medication");
+    expect(JSON.stringify(summary)).not.toContain("dose");
+    expect(getErrorCode(await clientFor(2).care.phase3.digestPreference.query({ familyId: 10 }).then(() => null, e => e))).toBe("FORBIDDEN");
+  });
+
+  it("keeps safety and core features available in the free-plan scaffold", async () => {
+    const owner = clientFor(2);
+    const plan = await owner.care.phase3.planStatus.query({ familyId: 20 });
+    expect(plan).toMatchObject({ plan: "free", premiumAvailable: false, billingConfigured: false, entitlements: { coreCare: true, safetyFeatures: true, familyDataAccess: true } });
+    await expect(owner.care.medications.list.query({ familyId: 20 })).resolves.toHaveLength(1);
+    expect(plan.message).toContain("no pricing, signup, or payment");
   });
 });

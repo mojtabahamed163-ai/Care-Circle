@@ -26,6 +26,7 @@ const taskFields = {
   assigneeId: z.number().int().positive().nullable().optional(),
   recurrence: z.enum(["none", "daily", "weekly", "monthly"]),
   notes: z.string().max(5000).nullable().optional(),
+  estimatedMinutes: z.number().int().min(1).max(1440).nullable().optional(),
 };
 const medicationFields = {
   name: z.string().trim().min(1).max(180),
@@ -41,6 +42,7 @@ const medicationFields = {
   endDate: isoDate.nullable().optional(),
   notes: z.string().max(5000).nullable().optional(),
   assigneeId: z.number().int().positive().nullable().optional(),
+  escalationRecipientId: z.number().int().positive().nullable().optional(),
 };
 
 export const appRouter = router({
@@ -62,6 +64,17 @@ export const appRouter = router({
     }),
   }),
   care: router({
+    phase3: router({
+      workload: protectedProcedure.input(z.object({ familyId, startDate: isoDate, endDate: isoDate }).refine(v => v.startDate <= v.endDate, { path: ["endDate"], message: "End date must be on or after the start date." }).refine(v => Date.parse(`${v.endDate}T00:00:00Z`) - Date.parse(`${v.startDate}T00:00:00Z`) <= 31 * 86400000, { path: ["endDate"], message: "Choose a range of 32 days or less." })).query(({ ctx, input }) => care.getWorkloadReport(ctx.user.id, input.familyId, input.startDate, input.endDate)),
+      weeklySummary: protectedProcedure.input(z.object({ familyId, startDate: isoDate, endDate: isoDate }).refine(v => v.startDate <= v.endDate, { path: ["endDate"], message: "End date must be on or after the start date." }).refine(v => Date.parse(`${v.endDate}T00:00:00Z`) - Date.parse(`${v.startDate}T00:00:00Z`) <= 6 * 86400000, { path: ["endDate"], message: "Weekly summaries cover at most 7 days." })).query(({ ctx, input }) => care.getWeeklySummary(ctx.user.id, input.familyId, input.startDate, input.endDate)),
+      digestPreference: protectedProcedure.input(z.object({ familyId })).query(({ ctx, input }) => care.getDigestPreference(ctx.user.id, input.familyId)),
+      setDigestPreference: protectedProcedure.input(z.object({ familyId, enabled: z.boolean() })).mutation(({ ctx, input }) => care.setDigestPreference(ctx.user.id, input.familyId, input.enabled)),
+      notificationPreferences: protectedProcedure.input(z.object({ familyId })).query(({ ctx, input }) => care.getNotificationPreferences(ctx.user.id, input.familyId)),
+      setNotificationPreferences: protectedProcedure.input(z.object({ familyId, reminderOptIn: z.boolean(), escalationOptIn: z.boolean() })).mutation(({ ctx, input }) => care.setNotificationPreferences(ctx.user.id, input.familyId, input.reminderOptIn, input.escalationOptIn)),
+      inbox: protectedProcedure.input(z.object({ familyId })).query(({ ctx, input }) => care.listInAppNotifications(ctx.user.id, input.familyId)),
+      markNotificationRead: protectedProcedure.input(z.object({ familyId, notificationId: z.number().int().positive() })).mutation(({ ctx, input }) => care.markInAppNotificationRead(ctx.user.id, input.familyId, input.notificationId)),
+      planStatus: protectedProcedure.input(z.object({ familyId })).query(({ ctx, input }) => care.getPlanStatus(ctx.user.id, input.familyId)),
+    }),
     families: router({
       list: protectedProcedure.query(({ ctx }) =>
         care.listFamilies(ctx.user.id)
@@ -194,10 +207,28 @@ export const appRouter = router({
           care.deleteTask(ctx.user.id, input.familyId, input.taskId)
         ),
     }),
+    collaboration: router({
+      requests: protectedProcedure.input(z.object({ familyId })).query(({ ctx, input }) => care.listCollaborationRequests(ctx.user.id, input.familyId)),
+      request: protectedProcedure.input(z.object({ familyId, taskId: z.number().int().positive(), targetId: z.number().int().positive(), kind: z.enum(["help", "swap"]) })).mutation(({ ctx, input }) => care.requestTaskCollaboration(ctx.user.id, input.familyId, input.taskId, input.targetId, input.kind)),
+      respond: protectedProcedure.input(z.object({ familyId, requestId: z.number().int().positive(), accept: z.boolean() })).mutation(({ ctx, input }) => care.respondTaskCollaboration(ctx.user.id, input.familyId, input.requestId, input.accept)),
+    }),
+    absences: router({
+      list: protectedProcedure.input(z.object({ familyId })).query(({ ctx, input }) => care.listAbsences(ctx.user.id, input.familyId)),
+      create: protectedProcedure.input(z.object({ familyId, memberId: z.number().int().positive(), startDate: isoDate, endDate: isoDate, note: z.string().trim().max(1000).nullable().optional() })).mutation(({ ctx, input }) => care.createAbsence(ctx.user.id, input.familyId, input)),
+    }),
+    audit: router({
+      list: protectedProcedure.input(z.object({ familyId })).query(({ ctx, input }) => care.listCareAudit(ctx.user.id, input.familyId)),
+    }),
+    handoffs: router({
+      list: protectedProcedure.input(z.object({ familyId })).query(({ ctx, input }) => care.listCareHandoffs(ctx.user.id, input.familyId)),
+      create: protectedProcedure.input(z.object({ familyId, eventId: z.number().int().positive(), recipientId: z.number().int().positive(), context: z.string().trim().min(1).max(8000), pendingTaskIds: z.array(z.number().int().positive()).max(100) })).mutation(({ ctx, input }) => care.createCareHandoff(ctx.user.id, input.familyId, input)),
+    }),
     medications: router({
       list: protectedProcedure
         .input(z.object({ familyId }))
-        .query(({ ctx, input }) => care.listMedications(ctx.user.id, input.familyId)),
+        .query(({ ctx, input }) =>
+          care.listMedications(ctx.user.id, input.familyId)
+        ),
       create: protectedProcedure
         .input(
           z
@@ -320,6 +351,100 @@ export const appRouter = router({
         )
         .mutation(({ ctx, input }) =>
           care.createCareNote(ctx.user.id, input.familyId, input)
+        ),
+    }),
+    householdNeeds: router({
+      list: protectedProcedure
+        .input(z.object({ familyId }))
+        .query(({ ctx, input }) =>
+          care.listHouseholdNeeds(ctx.user.id, input.familyId)
+        ),
+      create: protectedProcedure
+        .input(
+          z.object({
+            familyId,
+            name: z.string().trim().min(1).max(180),
+            quantity: z.string().trim().max(120).nullable().optional(),
+            priority: z.enum(["low", "medium", "high"]),
+            buyerId: z.number().int().positive().nullable().optional(),
+          })
+        )
+        .mutation(({ ctx, input }) =>
+          care.createHouseholdNeed(ctx.user.id, input.familyId, input)
+        ),
+      update: protectedProcedure
+        .input(
+          z.object({
+            familyId,
+            needId: z.number().int().positive(),
+            name: z.string().trim().min(1).max(180),
+            quantity: z.string().trim().max(120).nullable().optional(),
+            priority: z.enum(["low", "medium", "high"]),
+            buyerId: z.number().int().positive().nullable().optional(),
+            completed: z.boolean(),
+          })
+        )
+        .mutation(({ ctx, input }) => {
+          const { familyId: id, needId, ...fields } = input;
+          return care.updateHouseholdNeed(ctx.user.id, id, needId, fields);
+        }),
+      delete: protectedProcedure
+        .input(z.object({ familyId, needId: z.number().int().positive() }))
+        .mutation(({ ctx, input }) =>
+          care.deleteHouseholdNeed(ctx.user.id, input.familyId, input.needId)
+        ),
+    }),
+    importantContacts: router({
+      list: protectedProcedure
+        .input(z.object({ familyId }))
+        .query(({ ctx, input }) =>
+          care.listImportantContacts(ctx.user.id, input.familyId)
+        ),
+      create: protectedProcedure
+        .input(
+          z.object({
+            familyId,
+            kind: z.enum(["provider", "clinic", "family", "emergency"]),
+            name: z.string().trim().min(1).max(180),
+            organization: z.string().trim().max(180).nullable().optional(),
+            phone: z.string().trim().max(80).nullable().optional(),
+            email: z.string().trim().email().max(320).nullable().optional(),
+            notes: z.string().trim().max(1000).nullable().optional(),
+          })
+        )
+        .mutation(({ ctx, input }) =>
+          care.createImportantContact(ctx.user.id, input.familyId, input)
+        ),
+      update: protectedProcedure
+        .input(
+          z.object({
+            familyId,
+            contactId: z.number().int().positive(),
+            kind: z.enum(["provider", "clinic", "family", "emergency"]),
+            name: z.string().trim().min(1).max(180),
+            organization: z.string().trim().max(180).nullable().optional(),
+            phone: z.string().trim().max(80).nullable().optional(),
+            email: z.string().trim().email().max(320).nullable().optional(),
+            notes: z.string().trim().max(1000).nullable().optional(),
+          })
+        )
+        .mutation(({ ctx, input }) => {
+          const { familyId: id, contactId, ...fields } = input;
+          return care.updateImportantContact(
+            ctx.user.id,
+            id,
+            contactId,
+            fields
+          );
+        }),
+      delete: protectedProcedure
+        .input(z.object({ familyId, contactId: z.number().int().positive() }))
+        .mutation(({ ctx, input }) =>
+          care.deleteImportantContact(
+            ctx.user.id,
+            input.familyId,
+            input.contactId
+          )
         ),
     }),
   }),

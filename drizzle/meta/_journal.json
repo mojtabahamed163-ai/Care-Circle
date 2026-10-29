@@ -36,6 +36,34 @@
       "when": 1793198555509,
       "tag": "0004_phase1_medication_doses_and_time_zones",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "5",
+      "when": 1793289465157,
+      "tag": "0005_shared_household_lists",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "5",
+      "when": 1793289903845,
+      "tag": "0006_phase2_collaboration",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "5",
+      "when": 1793290458708,
+      "tag": "0007_phase3_digest_preferences_and_estimates",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "5",
+      "when": 1793290888658,
+      "tag": "0008_phase2_in_app_dose_notifications",
+      "breakpoints": true
     }
   ]
 }

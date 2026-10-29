@@ -16,6 +16,7 @@ export type TaskFormItem = {
   status: "new" | "in_progress" | "completed";
   recurrence: "none" | "daily" | "weekly" | "monthly";
   notes: string | null;
+  estimatedMinutes: number | null;
 };
 export type MedicationFormItem = {
   id: number;
@@ -28,6 +29,7 @@ export type MedicationFormItem = {
   endDate: string | null;
   notes: string | null;
   assigneeId: number | null;
+  escalationRecipientId: number | null;
   active: boolean;
 };
 export type EventFormItem = {
@@ -228,6 +230,9 @@ export default function CareDialog({
                     defaultValue={localDateTime(mode.item?.dueAt)}
                   />
                 </Field>
+                <Field label="Estimated effort (minutes, optional)">
+                  <input name="estimatedMinutes" type="number" min={1} max={1440} step={1} defaultValue={mode.item?.estimatedMinutes ?? ""} />
+                </Field>
                 <Field label="Priority">
                   <select
                     name="priority"
@@ -359,6 +364,12 @@ export default function CareDialog({
                 initial={mode.item?.assigneeId}
                 label="Family point person"
               />
+              <Field label="20-minute escalation recipient (optional; must opt in)">
+                <select name="escalationRecipientId" defaultValue={mode.item?.escalationRecipientId ?? ""}>
+                  <option value="">No escalation recipient</option>
+                  {members.map(member => <option value={member.userId} key={member.userId}>{member.name || "Family member"}</option>)}
+                </select>
+              </Field>
               <Field label="Notes">
                 <textarea
                   name="notes"

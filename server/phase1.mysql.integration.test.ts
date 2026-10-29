@@ -4,7 +4,15 @@ import { createTRPCClient, httpBatchLink } from "@trpc/client";
 import { createExpressMiddleware } from "@trpc/server/adapters/express";
 import { and, desc, eq, gt } from "drizzle-orm";
 import superjson from "superjson";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 import { dateKeyInZone, resolveLocalDateTime } from "../shared/timezone";
 import { COOKIE_NAME } from "../shared/const";
 import {
@@ -23,6 +31,7 @@ import { appRouter, type AppRouter } from "./routers";
 import { createContext } from "./_core/context";
 import { sdk } from "./_core/sdk";
 import { getDb, upsertUser } from "./db";
+import { reconcileDueDoseNotifications } from "./care-db";
 
 const testDatabaseUrl = process.env.CARE_CIRCLE_TEST_DATABASE_URL;
 if (testDatabaseUrl) {
@@ -46,7 +55,7 @@ const originalEnv = {
   jwtSecret: process.env.MANUS_JWT_SECRET,
 };
 
-suite("Phase 1 against an isolated local MySQL database", () => {
+suite("Care Circle against an isolated local MySQL database", () => {
   let server: Server;
   let endpoint = "";
   let database: Awaited<ReturnType<typeof getDb>>;
@@ -158,7 +167,7 @@ suite("Phase 1 against an isolated local MySQL database", () => {
     }
   });
 
-  it("verifies persistent multi-dose confirmations, IANA appointments, family isolation, and account anonymization", async () => {
+  it("covers care, collaboration, household insights, and in-app notifications", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(new Date("2026-10-28T12:00:00.000Z"));
     const owner = await clientFor(0);
@@ -441,6 +450,235 @@ suite("Phase 1 against an isolated local MySQL database", () => {
     const successorMember = (
       await owner.care.families.members.query({ familyId: familyA.id })
     ).find(member => member.userId === identities[2]!.id)!;
+
+    const need = await owner.care.householdNeeds.create.mutate({
+      familyId: familyA.id,
+      name: "Household supplies",
+      quantity: "2",
+      priority: "high",
+      buyerId: identities[2]!.id,
+    });
+    expect(need.success).toBe(true);
+    await owner.care.importantContacts.create.mutate({
+      familyId: familyA.id,
+      kind: "emergency",
+      name: "Family contact",
+      phone: "+1-555-0100",
+    });
+    const needRows = await owner.care.householdNeeds.list.query({
+      familyId: familyA.id,
+    });
+    expect(needRows).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "Household supplies",
+          buyerName: "Taylor Successor",
+        }),
+      ])
+    );
+    await expect(
+      owner.care.importantContacts.list.query({ familyId: familyA.id })
+    ).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: "emergency", name: "Family contact" }),
+      ])
+    );
+
+    await owner.care.tasks.create.mutate({
+      familyId: familyA.id,
+      title: "Support requested",
+      dueAt: new Date("2026-10-29T10:00:00.000Z"),
+      priority: "medium",
+      assigneeId: identities[0]!.id,
+      recurrence: "none",
+      estimatedMinutes: 45,
+    });
+    const [supportTask] = await database!
+      .select()
+      .from(careTasks)
+      .where(
+        and(
+          eq(careTasks.familyId, familyA.id),
+          eq(careTasks.title, "Support requested")
+        )
+      )
+      .limit(1);
+    const supportRequest = await owner.care.collaboration.request.mutate({
+      familyId: familyA.id,
+      taskId: supportTask!.id,
+      targetId: identities[2]!.id,
+      kind: "help",
+    });
+    await successor.care.collaboration.respond.mutate({
+      familyId: familyA.id,
+      requestId: supportRequest.requestId,
+      accept: true,
+    });
+    const reassignedTask = (
+      await owner.care.tasks.list.query({ familyId: familyA.id })
+    ).find(item => item.id === supportTask!.id);
+    expect(reassignedTask?.assigneeId).toBe(identities[2]!.id);
+
+    await owner.care.absences.create.mutate({
+      familyId: familyA.id,
+      memberId: identities[2]!.id,
+      startDate: "2026-10-29",
+      endDate: "2026-10-30",
+      note: "Out of town",
+    });
+    const absenceRows = await owner.care.absences.list.query({
+      familyId: familyA.id,
+    });
+    expect(absenceRows[0]?.affectedTasks.map(task => task.id)).toContain(
+      supportTask!.id
+    );
+
+    await owner.care.events.create.mutate({
+      familyId: familyA.id,
+      title: "After-visit review",
+      kind: "visit",
+      startsAtLocal: "2026-10-30T14:00",
+      timeZone: "UTC",
+      reminderMinutes: 0,
+    });
+    const [visit] = await database!
+      .select({ id: careEvents.id })
+      .from(careEvents)
+      .where(
+        and(
+          eq(careEvents.familyId, familyA.id),
+          eq(careEvents.title, "After-visit review")
+        )
+      )
+      .limit(1);
+    await owner.care.handoffs.create.mutate({
+      familyId: familyA.id,
+      eventId: visit!.id,
+      recipientId: identities[2]!.id,
+      context: "Review the clinician-provided plan.",
+      pendingTaskIds: [supportTask!.id],
+    });
+    await expect(
+      owner.care.audit.list.query({ familyId: familyA.id })
+    ).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ action: "task.assigned_by_approval" }),
+        expect.objectContaining({ action: "absence.recorded" }),
+      ])
+    );
+    await expect(
+      owner.care.handoffs.list.query({ familyId: familyA.id })
+    ).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          context: "Review the clinician-provided plan.",
+        }),
+      ])
+    );
+    const reportRange = {
+      familyId: familyA.id,
+      startDate: "2026-10-29",
+      endDate: "2026-11-04",
+    };
+    const workload = await owner.care.phase3.workload.query(reportRange);
+    expect(workload.members).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          userId: identities[2]!.id,
+          estimatedMinutesTotal: 45,
+        }),
+      ])
+    );
+    await expect(
+      owner.care.phase3.weeklySummary.query(reportRange)
+    ).resolves.toMatchObject({ unassignedTasks: expect.any(Number) });
+    await owner.care.phase3.setDigestPreference.mutate({
+      familyId: familyA.id,
+      enabled: true,
+    });
+    await expect(
+      owner.care.phase3.digestPreference.query({ familyId: familyA.id })
+    ).resolves.toMatchObject({ enabled: true, deliveryConfigured: false });
+    await owner.care.phase3.setDigestPreference.mutate({
+      familyId: familyA.id,
+      enabled: false,
+    });
+
+    await owner.care.phase3.setNotificationPreferences.mutate({
+      familyId: familyA.id,
+      reminderOptIn: true,
+      escalationOptIn: false,
+    });
+    await successor.care.phase3.setNotificationPreferences.mutate({
+      familyId: familyA.id,
+      reminderOptIn: false,
+      escalationOptIn: true,
+    });
+    const notificationMedication = await owner.care.medications.create.mutate({
+      familyId: familyA.id,
+      name: "Notification integration medication",
+      dose: "As prescribed",
+      schedule: "Daily",
+      doseTimes: "00:00",
+      timeZone: "UTC",
+      startDate: "2026-10-29",
+      endDate: "2026-10-29",
+      assigneeId: identities[0]!.id,
+      escalationRecipientId: identities[2]!.id,
+    });
+    expect(notificationMedication.success).toBe(true);
+    const [notificationMedicationRow] = await database!
+      .select({ id: medications.id })
+      .from(medications)
+      .where(
+        and(
+          eq(medications.familyId, familyA.id),
+          eq(medications.name, "Notification integration medication")
+        )
+      )
+      .limit(1);
+    expect(notificationMedicationRow?.id).toBeTruthy();
+    vi.setSystemTime(new Date("2026-10-29T00:10:00.000Z"));
+    await reconcileDueDoseNotifications(new Date());
+    const dueInbox = await owner.care.phase3.inbox.query({
+      familyId: familyA.id,
+    });
+    expect(dueInbox.map(item => item.kind)).toContain("due_reminder");
+    expect(dueInbox.map(item => item.kind)).toContain("unconfirmed_10m");
+    expect(
+      dueInbox.every(item => item.emailDeliveryStatus === "not_configured")
+    ).toBe(true);
+    vi.setSystemTime(new Date("2026-10-29T00:20:00.000Z"));
+    await reconcileDueDoseNotifications(new Date());
+    const escalationInbox = await successor.care.phase3.inbox.query({
+      familyId: familyA.id,
+    });
+    expect(escalationInbox.map(item => item.kind)).toContain("escalation_20m");
+    await owner.care.medications.confirm.mutate({
+      familyId: familyA.id,
+      medicationId: notificationMedicationRow!.id,
+      doseDate: "2026-10-29",
+      doseTime: "00:00",
+    });
+    const cancelledInbox = await owner.care.phase3.inbox.query({
+      familyId: familyA.id,
+    });
+    expect(
+      cancelledInbox
+        .filter(item => item.doseTime === "00:00")
+        .every(item => item.status === "cancelled")
+    ).toBe(true);
+    const exportBeforeDelete = await successor.care.families.export.mutate({
+      familyId: familyA.id,
+    });
+    expect(exportBeforeDelete).toMatchObject({
+      collaborationRequests: expect.any(Array),
+      absences: expect.any(Array),
+      auditHistory: expect.any(Array),
+      handoffs: expect.any(Array),
+      notificationEvents: expect.any(Array),
+    });
+
     await owner.care.families.transferOwnership.mutate({
       familyId: familyA.id,
       memberId: successorMember.id,

@@ -17,10 +17,21 @@ import {
   dateKeyInZone,
   isValidTimeZone,
   resolveLocalDateTime,
+  scheduledDoseInstant,
 } from "../shared/timezone";
-import { nextRecurringDueDate, normalizeDoseTimes, storedDoseTimes } from "./care-utils";
+import {
+  nextRecurringDueDate,
+  normalizeDoseTimes,
+  storedDoseTimes,
+} from "./care-utils";
 import {
   careEvents,
+  careAbsences,
+  careAuditLog,
+  careHandoffs,
+  careDigestPreferences,
+  notificationPreferences,
+  notificationEvents,
   careNotes,
   careTaskCompletions,
   careTasks,
@@ -28,13 +39,32 @@ import {
   families,
   familyInvitations,
   familyMembers,
+  householdNeeds,
+  importantContacts,
   medications,
+  taskCollaborationRequests,
   users,
 } from "../drizzle/schema";
 import { getDb } from "./db";
+import { planDoseNotifications } from "./notification-scheduler";
 
 export type FamilyRole = "owner" | "coordinator" | "caregiver" | "viewer";
 const managers: FamilyRole[] = ["owner", "coordinator"];
+
+async function recordAudit(
+  tx: any,
+  input: {
+    familyId: number;
+    actorId: number;
+    action: string;
+    resourceType: string;
+    resourceId?: number | null;
+    previousValues?: Record<string, unknown> | null;
+    newValues?: Record<string, unknown> | null;
+  }
+) {
+  await tx.insert(careAuditLog).values(input);
+}
 
 export async function requireMembership(userId: number, familyId: number) {
   const db = await getDb();
@@ -191,7 +221,15 @@ export async function exportFamily(userId: number, familyId: number) {
     doseConfirmationsRows,
     events,
     careJournal,
+    householdNeedsRows,
+    contacts,
     invitations,
+    collaborationRequests,
+    absences,
+    auditHistory,
+    handoffs,
+    notificationPrefs,
+    notificationHistory,
   ] = await Promise.all([
     db
       .select({
@@ -244,6 +282,16 @@ export async function exportFamily(userId: number, familyId: number) {
       .where(eq(careNotes.familyId, familyId))
       .orderBy(asc(careNotes.createdAt)),
     db
+      .select()
+      .from(householdNeeds)
+      .where(eq(householdNeeds.familyId, familyId))
+      .orderBy(asc(householdNeeds.createdAt)),
+    db
+      .select()
+      .from(importantContacts)
+      .where(eq(importantContacts.familyId, familyId))
+      .orderBy(asc(importantContacts.kind), asc(importantContacts.name)),
+    db
       .select({
         id: familyInvitations.id,
         email: familyInvitations.email,
@@ -257,7 +305,32 @@ export async function exportFamily(userId: number, familyId: number) {
       .from(familyInvitations)
       .where(eq(familyInvitations.familyId, familyId))
       .orderBy(asc(familyInvitations.createdAt)),
+    db
+      .select()
+      .from(taskCollaborationRequests)
+      .where(eq(taskCollaborationRequests.familyId, familyId))
+      .orderBy(asc(taskCollaborationRequests.createdAt)),
+    db
+      .select()
+      .from(careAbsences)
+      .where(eq(careAbsences.familyId, familyId))
+      .orderBy(asc(careAbsences.startDate)),
+    db
+      .select()
+      .from(careAuditLog)
+      .where(eq(careAuditLog.familyId, familyId))
+      .orderBy(asc(careAuditLog.createdAt)),
+    db
+      .select()
+      .from(careHandoffs)
+      .where(eq(careHandoffs.familyId, familyId))
+      .orderBy(asc(careHandoffs.createdAt)),
+    db.select().from(notificationPreferences).where(eq(notificationPreferences.familyId, familyId)).orderBy(asc(notificationPreferences.userId)),
+    db.select().from(notificationEvents).where(eq(notificationEvents.familyId, familyId)).orderBy(asc(notificationEvents.createdAt)),
   ]);
+  const digestPreferences = await db.select().from(careDigestPreferences)
+    .where(eq(careDigestPreferences.familyId, familyId))
+    .orderBy(asc(careDigestPreferences.userId));
   return {
     exportedAt: new Date().toISOString(),
     family,
@@ -268,8 +341,122 @@ export async function exportFamily(userId: number, familyId: number) {
     doseConfirmations: doseConfirmationsRows,
     events,
     careJournal,
+    householdNeeds: householdNeedsRows,
+    importantContacts: contacts,
     invitations,
+    collaborationRequests,
+    absences,
+    auditHistory,
+    handoffs,
+    digestPreferences,
+    notificationPreferences: notificationPrefs,
+    notificationEvents: notificationHistory,
   };
+}
+
+function reportBounds(startDate: string, endDate: string) {
+  return { start: new Date(`${startDate}T00:00:00.000Z`), end: new Date(`${endDate}T23:59:59.999Z`) };
+}
+
+export async function getWorkloadReport(userId: number, familyId: number, startDate: string, endDate: string) {
+  await requireMembership(userId, familyId);
+  const db = await getDb();
+  if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
+  const { start, end } = reportBounds(startDate, endDate);
+  const tasks = await db.select({ id: careTasks.id, familyId: careTasks.familyId, title: careTasks.title, assigneeId: careTasks.assigneeId, status: careTasks.status, dueAt: careTasks.dueAt, completedAt: careTasks.completedAt, estimatedMinutes: careTasks.estimatedMinutes }).from(careTasks).where(and(eq(careTasks.familyId, familyId), or(and(gte(careTasks.dueAt, start), lte(careTasks.dueAt, end)), and(gte(careTasks.completedAt, start), lte(careTasks.completedAt, end)))));
+  const people = await db.select({ userId: familyMembers.userId, name: users.name }).from(familyMembers).innerJoin(users, eq(familyMembers.userId, users.id)).where(eq(familyMembers.familyId, familyId));
+  const now = new Date();
+  const buckets = new Map<number | null, { userId: number | null; name: string; completed: number; upcoming: number; overdue: number; estimatedMinutesTotal: number | null }>();
+  for (const person of people) buckets.set(person.userId, { userId: person.userId, name: person.name || "Family member", completed: 0, upcoming: 0, overdue: 0, estimatedMinutesTotal: 0 });
+  buckets.set(null, { userId: null, name: "Unassigned", completed: 0, upcoming: 0, overdue: 0, estimatedMinutesTotal: 0 });
+  for (const task of tasks) {
+    const bucket = buckets.get(task.assigneeId) ?? buckets.get(null)!;
+    if (task.status === "completed" && task.completedAt && task.completedAt >= start && task.completedAt <= end) bucket.completed++;
+    else if (task.status !== "completed" && task.dueAt && task.dueAt >= start && task.dueAt <= end) {
+      if (task.dueAt < now) bucket.overdue++;
+      else bucket.upcoming++;
+    }
+    if (task.estimatedMinutes != null) bucket.estimatedMinutesTotal = (bucket.estimatedMinutesTotal ?? 0) + task.estimatedMinutes;
+  }
+  return { familyId, startDate, endDate, members: [...buckets.values()], caveat: "Counts and optional estimates support a family conversation; they do not measure fairness. Tasks differ in effort and circumstances. No one is scored, ranked, or judged." };
+}
+
+export async function getWeeklySummary(userId: number, familyId: number, startDate: string, endDate: string) {
+  await requireMembership(userId, familyId);
+  const db = await getDb();
+  if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
+  const { start, end } = reportBounds(startDate, endDate);
+  const [tasks, events, requests] = await Promise.all([
+    db.select({ id: careTasks.id, status: careTasks.status, dueAt: careTasks.dueAt, completedAt: careTasks.completedAt, assigneeId: careTasks.assigneeId }).from(careTasks).where(and(eq(careTasks.familyId, familyId), or(and(gte(careTasks.dueAt, start), lte(careTasks.dueAt, end)), and(gte(careTasks.completedAt, start), lte(careTasks.completedAt, end))))),
+    db.select({ id: careEvents.id, title: careEvents.title, kind: careEvents.kind, startsAt: careEvents.startsAt }).from(careEvents).where(and(eq(careEvents.familyId, familyId), gte(careEvents.startsAt, start), lte(careEvents.startsAt, end))).orderBy(asc(careEvents.startsAt)),
+    db.select({ id: taskCollaborationRequests.id }).from(taskCollaborationRequests).where(and(eq(taskCollaborationRequests.familyId, familyId), eq(taskCollaborationRequests.status, "pending"), gte(taskCollaborationRequests.createdAt, start), lte(taskCollaborationRequests.createdAt, end))),
+  ]);
+  const inRange = (date: Date | null) => !!date && date >= start && date <= end;
+  return { familyId, startDate, endDate,
+    completedTasks: tasks.filter(row => row.status === "completed" && inRange(row.completedAt)).length,
+    pendingTasks: tasks.filter(row => row.status !== "completed" && inRange(row.dueAt)).length,
+    events: events.map(({ title, kind, startsAt }) => ({ title, kind, startsAt })),
+    unassignedTasks: tasks.filter(row => row.status !== "completed" && row.assigneeId == null && (inRange(row.dueAt) || !row.dueAt)).length,
+    pendingHelpRequests: requests.length,
+    privacy: "Counts and event titles only. Care notes, medication details, and task notes are excluded by default." };
+}
+
+export async function getDigestPreference(userId: number, familyId: number) {
+  await requireMembership(userId, familyId);
+  const db = await getDb();
+  if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
+  const [row] = await db.select({ enabled: careDigestPreferences.enabled }).from(careDigestPreferences).where(and(eq(careDigestPreferences.familyId, familyId), eq(careDigestPreferences.userId, userId))).limit(1);
+  return { familyId, enabled: row?.enabled ?? false, kind: "preference_only" as const, deliveryConfigured: false };
+}
+
+export async function setDigestPreference(userId: number, familyId: number, enabled: boolean) {
+  await requireMembership(userId, familyId);
+  const db = await getDb();
+  if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
+  const [row] = await db.select({ id: careDigestPreferences.id }).from(careDigestPreferences).where(and(eq(careDigestPreferences.familyId, familyId), eq(careDigestPreferences.userId, userId))).limit(1);
+  if (row) await db.update(careDigestPreferences).set({ enabled }).where(and(eq(careDigestPreferences.familyId, familyId), eq(careDigestPreferences.userId, userId)));
+  else await db.insert(careDigestPreferences).values({ familyId, userId, enabled });
+  return { familyId, enabled, kind: "preference_only" as const, deliveryConfigured: false, message: "Saved preference only; email delivery and scheduling are not configured." };
+}
+
+export async function getNotificationPreferences(userId: number, familyId: number) {
+  await requireMembership(userId, familyId);
+  const db = await getDb();
+  if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
+  const [row] = await db.select({ reminderOptIn: notificationPreferences.reminderOptIn, escalationOptIn: notificationPreferences.escalationOptIn }).from(notificationPreferences).where(and(eq(notificationPreferences.familyId, familyId), eq(notificationPreferences.userId, userId))).limit(1);
+  return { familyId, reminderOptIn: row?.reminderOptIn ?? false, escalationOptIn: row?.escalationOptIn ?? false, emailDeliveryConfigured: false, deliveryMode: "in_app_only" as const };
+}
+
+export async function setNotificationPreferences(userId: number, familyId: number, reminderOptIn: boolean, escalationOptIn: boolean) {
+  await requireMembership(userId, familyId);
+  const db = await getDb();
+  if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
+  const [row] = await db.select({ id: notificationPreferences.id }).from(notificationPreferences).where(and(eq(notificationPreferences.familyId, familyId), eq(notificationPreferences.userId, userId))).limit(1);
+  if (row) await db.update(notificationPreferences).set({ reminderOptIn, escalationOptIn }).where(and(eq(notificationPreferences.familyId, familyId), eq(notificationPreferences.userId, userId)));
+  else await db.insert(notificationPreferences).values({ familyId, userId, reminderOptIn, escalationOptIn });
+  const revokedKinds = [!reminderOptIn ? or(eq(notificationEvents.kind, "due_reminder"), eq(notificationEvents.kind, "unconfirmed_10m")) : undefined, !escalationOptIn ? eq(notificationEvents.kind, "escalation_20m") : undefined].filter(Boolean);
+  if (revokedKinds.length) await db.update(notificationEvents).set({ status: "cancelled" }).where(and(eq(notificationEvents.familyId, familyId), eq(notificationEvents.recipientId, userId), eq(notificationEvents.status, "created"), or(...revokedKinds as any[])));
+  return { familyId, reminderOptIn, escalationOptIn, emailDeliveryConfigured: false, message: "Saved consent for in-app notifications only. Email delivery is not configured; nothing is sent outside this app." };
+}
+
+export async function listInAppNotifications(userId: number, familyId: number) {
+  await requireMembership(userId, familyId);
+  const db = await getDb();
+  if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
+  return db.select({ id: notificationEvents.id, medicationId: notificationEvents.medicationId, doseDate: notificationEvents.doseDate, doseTime: notificationEvents.doseTime, kind: notificationEvents.kind, message: notificationEvents.message, scheduledAt: notificationEvents.scheduledAt, status: notificationEvents.status, emailDeliveryStatus: notificationEvents.emailDeliveryStatus, createdAt: notificationEvents.createdAt, readAt: notificationEvents.readAt }).from(notificationEvents).where(and(eq(notificationEvents.familyId, familyId), eq(notificationEvents.recipientId, userId), or(eq(notificationEvents.status, "created"), eq(notificationEvents.status, "read")))).orderBy(desc(notificationEvents.createdAt)).limit(100);
+}
+
+export async function markInAppNotificationRead(userId: number, familyId: number, notificationId: number) {
+  await requireMembership(userId, familyId);
+  const db = await getDb();
+  if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
+  const result = await db.update(notificationEvents).set({ status: "read", readAt: new Date() }).where(and(eq(notificationEvents.id, notificationId), eq(notificationEvents.familyId, familyId), eq(notificationEvents.recipientId, userId), eq(notificationEvents.status, "created")));
+  return { success: true };
+}
+
+export async function getPlanStatus(userId: number, familyId: number) {
+  await requireMembership(userId, familyId);
+  return { familyId, plan: "free" as const, premiumAvailable: false, entitlements: { coreCare: true, safetyFeatures: true, familyDataAccess: true }, billingConfigured: false, message: "Free plan metadata only. Premium is not available; no pricing, signup, or payment is configured." };
 }
 
 function invitationDigest(token: string) {
@@ -455,26 +642,22 @@ export async function changeMemberRole(
   requireManager(role);
   const db = await getDb();
   if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
-  const [target] = await db
-    .select({ id: familyMembers.id, role: familyMembers.role })
-    .from(familyMembers)
-    .where(
-      and(eq(familyMembers.id, memberId), eq(familyMembers.familyId, familyId))
-    )
-    .limit(1);
-  if (!target) throw new TRPCError({ code: "NOT_FOUND" });
-  if (target.role === "owner")
-    throw new TRPCError({
-      code: "FORBIDDEN",
-      message: "The family owner role cannot be changed here.",
-    });
-  await db
-    .update(familyMembers)
-    .set({ role: nextRole })
-    .where(
-      and(eq(familyMembers.id, memberId), eq(familyMembers.familyId, familyId))
-    );
-  return { success: true };
+  return db.transaction(async tx => {
+    const [target] = await tx
+      .select({ id: familyMembers.id, role: familyMembers.role, userId: familyMembers.userId })
+      .from(familyMembers)
+      .where(and(eq(familyMembers.id, memberId), eq(familyMembers.familyId, familyId)))
+      .limit(1)
+      .for("update");
+    if (!target) throw new TRPCError({ code: "NOT_FOUND" });
+    if (target.role === "owner")
+      throw new TRPCError({ code: "FORBIDDEN", message: "The family owner role cannot be changed here." });
+    if (target.role !== nextRole) {
+      await tx.update(familyMembers).set({ role: nextRole }).where(and(eq(familyMembers.id, memberId), eq(familyMembers.familyId, familyId)));
+      await recordAudit(tx, { familyId, actorId: userId, action: "role.changed", resourceType: "member", resourceId: target.userId, previousValues: { role: target.role }, newValues: { role: nextRole } });
+    }
+    return { success: true };
+  });
 }
 
 export async function transferOwnership(
@@ -557,7 +740,7 @@ export async function removeMember(
   const db = await getDb();
   if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
   const [target] = await db
-    .select({ id: familyMembers.id, role: familyMembers.role })
+    .select({ id: familyMembers.id, role: familyMembers.role, userId: familyMembers.userId })
     .from(familyMembers)
     .where(
       and(eq(familyMembers.id, memberId), eq(familyMembers.familyId, familyId))
@@ -569,6 +752,9 @@ export async function removeMember(
       code: "FORBIDDEN",
       message: "The family owner cannot be removed.",
     });
+  await db.update(medications).set({ escalationRecipientId: null }).where(and(eq(medications.familyId, familyId), eq(medications.escalationRecipientId, target.userId)));
+  await db.update(notificationEvents).set({ status: "cancelled" }).where(and(eq(notificationEvents.familyId, familyId), eq(notificationEvents.recipientId, target.userId), eq(notificationEvents.status, "created")));
+  await db.delete(notificationPreferences).where(and(eq(notificationPreferences.familyId, familyId), eq(notificationPreferences.userId, target.userId)));
   await db
     .delete(familyMembers)
     .where(
@@ -586,6 +772,9 @@ export async function leaveFamily(userId: number, familyId: number) {
     });
   const db = await getDb();
   if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
+  await db.update(medications).set({ escalationRecipientId: null }).where(and(eq(medications.familyId, familyId), eq(medications.escalationRecipientId, userId)));
+  await db.update(notificationEvents).set({ status: "cancelled" }).where(and(eq(notificationEvents.familyId, familyId), eq(notificationEvents.recipientId, userId), eq(notificationEvents.status, "created")));
+  await db.delete(notificationPreferences).where(and(eq(notificationPreferences.familyId, familyId), eq(notificationPreferences.userId, userId)));
   await db
     .delete(familyMembers)
     .where(
@@ -634,8 +823,7 @@ export async function deleteAccount(userId: number) {
     const formerMemberId = Number(
       (tombstoneResult as { insertId?: number | bigint }).insertId
     );
-    if (!formerMemberId)
-      throw new TRPCError({ code: "INTERNAL_SERVER_ERROR" });
+    if (!formerMemberId) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR" });
 
     await tx
       .update(familyInvitations)
@@ -687,17 +875,39 @@ export async function deleteAccount(userId: number) {
       .set({ createdBy: formerMemberId })
       .where(eq(careNotes.createdBy, userId));
     await tx
+      .update(householdNeeds)
+      .set({ createdBy: formerMemberId })
+      .where(eq(householdNeeds.createdBy, userId));
+    await tx
+      .update(importantContacts)
+      .set({ createdBy: formerMemberId })
+      .where(eq(importantContacts.createdBy, userId));
+    await tx
       .update(careTasks)
       .set({ assigneeId: null })
       .where(eq(careTasks.assigneeId, userId));
     await tx
       .update(medications)
-      .set({ assigneeId: null })
-      .where(eq(medications.assigneeId, userId));
+      .set({ assigneeId: null, escalationRecipientId: null })
+      .where(or(eq(medications.assigneeId, userId), eq(medications.escalationRecipientId, userId)));
     await tx
       .update(careEvents)
       .set({ escortId: null })
       .where(eq(careEvents.escortId, userId));
+    await tx.update(taskCollaborationRequests).set({ requesterId: formerMemberId }).where(eq(taskCollaborationRequests.requesterId, userId));
+    await tx.update(taskCollaborationRequests).set({ targetId: formerMemberId }).where(eq(taskCollaborationRequests.targetId, userId));
+    await tx.update(careAbsences).set({ memberId: formerMemberId }).where(eq(careAbsences.memberId, userId));
+    await tx.update(careAbsences).set({ createdBy: formerMemberId }).where(eq(careAbsences.createdBy, userId));
+    await tx.update(careAuditLog).set({ actorId: formerMemberId }).where(eq(careAuditLog.actorId, userId));
+    await tx.update(careHandoffs).set({ fromUserId: formerMemberId }).where(eq(careHandoffs.fromUserId, userId));
+    await tx.update(careHandoffs).set({ recipientId: formerMemberId }).where(eq(careHandoffs.recipientId, userId));
+    await tx
+      .update(householdNeeds)
+      .set({ buyerId: null })
+      .where(eq(householdNeeds.buyerId, userId));
+    await tx.update(notificationEvents).set({ recipientId: formerMemberId, status: "cancelled" }).where(eq(notificationEvents.recipientId, userId));
+    await tx.delete(notificationPreferences).where(eq(notificationPreferences.userId, userId));
+    await tx.delete(careDigestPreferences).where(eq(careDigestPreferences.userId, userId));
     await tx.delete(familyMembers).where(eq(familyMembers.userId, userId));
     await tx.delete(users).where(eq(users.id, userId));
     return { success: true, sharedHistoryRetained: true } as const;
@@ -720,6 +930,7 @@ export async function listTasks(userId: number, familyId: number) {
       status: careTasks.status,
       recurrence: careTasks.recurrence,
       notes: careTasks.notes,
+      estimatedMinutes: careTasks.estimatedMinutes,
       createdBy: careTasks.createdBy,
       completedBy: careTasks.completedBy,
       completedAt: careTasks.completedAt,
@@ -796,6 +1007,7 @@ export async function createTask(
     assigneeId?: number | null;
     recurrence: "none" | "daily" | "weekly" | "monthly";
     notes?: string | null;
+    estimatedMinutes?: number | null;
   }
 ) {
   const role = await requireMembership(userId, familyId);
@@ -808,13 +1020,14 @@ export async function createTask(
   await requireAssigneeInFamily(input.assigneeId, familyId);
   const db = await getDb();
   if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
-  await db.insert(careTasks).values({
+  const [result] = await db.insert(careTasks).values({
     ...input,
     familyId,
     title: input.title.trim(),
     createdBy: userId,
     status: "new",
   });
+  await db.insert(careAuditLog).values({ familyId, actorId: userId, action: "task.created", resourceType: "task", resourceId: Number((result as { insertId?: number | bigint }).insertId), previousValues: null, newValues: { title: input.title.trim(), assigneeId: input.assigneeId ?? null, status: "new" } });
   return { success: true };
 }
 
@@ -831,6 +1044,7 @@ export async function updateTask(
     status: "new" | "in_progress" | "completed";
     recurrence: "none" | "daily" | "weekly" | "monthly";
     notes?: string | null;
+    estimatedMinutes?: number | null;
   }
 ) {
   const role = await requireMembership(userId, familyId);
@@ -874,6 +1088,8 @@ export async function updateTask(
     const newCompletion =
       input.status === "completed" && lockedTask.status !== "completed";
     const completedAt = new Date();
+    const oldAuditValues = { title: lockedTask.title, description: lockedTask.description, dueAt: lockedTask.dueAt, priority: lockedTask.priority, assigneeId: lockedTask.assigneeId, status: lockedTask.status, recurrence: lockedTask.recurrence, notes: lockedTask.notes, estimatedMinutes: lockedTask.estimatedMinutes };
+    const nextAuditValues = { title: input.title.trim(), description: input.description === undefined ? lockedTask.description : input.description, dueAt: repeatFrom, priority: input.priority, assigneeId: input.assigneeId === undefined ? lockedTask.assigneeId : input.assigneeId, status: input.status, recurrence: input.recurrence, notes: input.notes === undefined ? lockedTask.notes : input.notes, estimatedMinutes: input.estimatedMinutes === undefined ? lockedTask.estimatedMinutes : input.estimatedMinutes };
     await tx
       .update(careTasks)
       .set({
@@ -884,6 +1100,8 @@ export async function updateTask(
         completedAt: newCompletion ? completedAt : lockedTask.completedAt,
       })
       .where(and(eq(careTasks.id, taskId), eq(careTasks.familyId, familyId)));
+
+    await recordAudit(tx, { familyId, actorId: userId, action: newCompletion ? "task.completed" : "task.updated", resourceType: "task", resourceId: taskId, previousValues: oldAuditValues, newValues: nextAuditValues });
 
     if (newCompletion) {
       await tx.insert(careTaskCompletions).values({
@@ -937,10 +1155,61 @@ export async function deleteTask(
   requireManager(role);
   const db = await getDb();
   if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
-  await db
-    .delete(careTasks)
-    .where(and(eq(careTasks.id, taskId), eq(careTasks.familyId, familyId)));
-  return { success: true };
+  return db.transaction(async tx => {
+    const [task] = await tx.select().from(careTasks).where(and(eq(careTasks.id, taskId), eq(careTasks.familyId, familyId))).limit(1).for("update");
+    if (!task) throw new TRPCError({ code: "NOT_FOUND" });
+    await tx.delete(careTasks).where(and(eq(careTasks.id, taskId), eq(careTasks.familyId, familyId)));
+    await recordAudit(tx, { familyId, actorId: userId, action: "task.deleted", resourceType: "task", resourceId: taskId, previousValues: task, newValues: null });
+    return { success: true };
+  });
+}
+
+async function requireEscalationRecipientInFamily(userId: number | null | undefined, familyId: number) {
+  if (userId == null) return;
+  const db = await getDb();
+  if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
+  const [row] = await db.select({ memberId: familyMembers.id, optedIn: notificationPreferences.escalationOptIn }).from(familyMembers).leftJoin(notificationPreferences, and(eq(notificationPreferences.familyId, familyMembers.familyId), eq(notificationPreferences.userId, familyMembers.userId))).where(and(eq(familyMembers.familyId, familyId), eq(familyMembers.userId, userId))).limit(1);
+  if (!row?.memberId || row.optedIn !== true) throw new TRPCError({ code: "BAD_REQUEST", message: "Choose a current family member who has explicitly opted in to receive escalation alerts." });
+}
+
+/** Reconcile due instances into the durable in-app outbox; DB unique eventKey makes retries/restarts idempotent. This performs no network delivery. */
+export async function reconcileDueDoseNotifications(now = new Date()) {
+  const db = await getDb();
+  if (!db || !Number.isFinite(now.getTime())) return { created: 0, checked: 0 };
+  const meds = await db.select({ id: medications.id, familyId: medications.familyId, name: medications.name, doseTimes: medications.doseTimes, timeZone: medications.timeZone, startDate: medications.startDate, endDate: medications.endDate, assigneeId: medications.assigneeId, escalationRecipientId: medications.escalationRecipientId }).from(medications).where(eq(medications.active, true)).limit(1000);
+  let created = 0, checked = 0;
+  for (const med of meds) {
+    const zone = isValidTimeZone(med.timeZone) ? med.timeZone : "UTC";
+    const today = dateKeyInZone(now, zone);
+    const dates = [today, new Date(Date.parse(`${today}T12:00:00Z`) - 86400000).toISOString().slice(0, 10)];
+    for (const doseDate of dates) {
+      if ((med.startDate && doseDate < med.startDate) || (med.endDate && doseDate > med.endDate)) continue;
+      for (const doseTime of storedDoseTimes(med.doseTimes)) {
+        const dueAt = doseTime === "once" ? null : scheduledDoseInstant(doseDate, doseTime, zone);
+        if (!dueAt || dueAt.getTime() > now.getTime()) continue;
+        checked++;
+        await db.transaction(async tx => {
+          // Confirmation takes the same medication-row lock. This closes the race where the worker
+          // might insert a notification after confirmation's cancellation pass.
+          const [locked] = await tx.select({ id: medications.id }).from(medications).where(and(eq(medications.id, med.id), eq(medications.familyId, med.familyId), eq(medications.active, true))).limit(1).for("update");
+          if (!locked) return;
+          const [confirmation] = await tx.select({ id: doseConfirmations.id }).from(doseConfirmations).where(and(eq(doseConfirmations.familyId, med.familyId), eq(doseConfirmations.medicationId, med.id), eq(doseConfirmations.doseDate, doseDate), eq(doseConfirmations.doseTime, doseTime))).limit(1);
+          if (confirmation) {
+            await tx.update(notificationEvents).set({ status: "cancelled" }).where(and(eq(notificationEvents.familyId, med.familyId), eq(notificationEvents.medicationId, med.id), eq(notificationEvents.doseDate, doseDate), eq(notificationEvents.doseTime, doseTime), or(eq(notificationEvents.status, "created"), eq(notificationEvents.status, "read"))));
+            return;
+          }
+          const [assignee] = med.assigneeId ? await tx.select({ memberId: familyMembers.id, optedIn: notificationPreferences.reminderOptIn }).from(familyMembers).leftJoin(notificationPreferences, and(eq(notificationPreferences.familyId, familyMembers.familyId), eq(notificationPreferences.userId, familyMembers.userId))).where(and(eq(familyMembers.familyId, med.familyId), eq(familyMembers.userId, med.assigneeId))).limit(1) : [];
+          const [escalationRecipient] = med.escalationRecipientId ? await tx.select({ memberId: familyMembers.id, optedIn: notificationPreferences.escalationOptIn }).from(familyMembers).leftJoin(notificationPreferences, and(eq(notificationPreferences.familyId, familyMembers.familyId), eq(notificationPreferences.userId, familyMembers.userId))).where(and(eq(familyMembers.familyId, med.familyId), eq(familyMembers.userId, med.escalationRecipientId))).limit(1) : [];
+          const plans = planDoseNotifications({ medicationId: med.id, medicationName: med.name, doseDate, doseTime, timeZone: zone, now, assigneeId: med.assigneeId, assigneeIsCurrentMember: !!assignee?.memberId, assigneeReminderOptIn: assignee?.optedIn === true, escalationRecipientId: med.escalationRecipientId, escalationRecipientIsCurrentMember: !!escalationRecipient?.memberId, escalationRecipientOptIn: escalationRecipient?.optedIn === true, alreadyConfirmed: false });
+          for (const event of plans) {
+            await tx.insert(notificationEvents).values({ ...event, familyId: med.familyId, medicationId: med.id, emailDeliveryStatus: "not_configured" }).onDuplicateKeyUpdate({ set: { eventKey: event.eventKey } });
+            created++;
+          }
+        });
+      }
+    }
+  }
+  return { created, checked };
 }
 
 export async function listMedications(userId: number, familyId: number) {
@@ -960,13 +1229,16 @@ export async function listMedications(userId: number, familyId: number) {
       endDate: medications.endDate,
       notes: medications.notes,
       assigneeId: medications.assigneeId,
+      escalationRecipientId: medications.escalationRecipientId,
       active: medications.active,
       createdBy: medications.createdBy,
       assigneeName: users.name,
     })
     .from(medications)
     .leftJoin(users, eq(medications.assigneeId, users.id))
-    .where(and(eq(medications.familyId, familyId), eq(medications.active, true)))
+    .where(
+      and(eq(medications.familyId, familyId), eq(medications.active, true))
+    )
     .orderBy(asc(medications.name))
     .limit(100);
   const now = new Date();
@@ -998,10 +1270,7 @@ export async function listMedications(userId: number, familyId: number) {
     .where(
       and(
         eq(doseConfirmations.familyId, familyId),
-        inArray(
-          doseConfirmations.doseDate,
-          doseDates
-        ),
+        inArray(doseConfirmations.doseDate, doseDates),
         inArray(
           doseConfirmations.medicationId,
           activeRows.map(row => row.id)
@@ -1018,8 +1287,7 @@ export async function listMedications(userId: number, familyId: number) {
     ...row,
     doses: storedDoseTimes(row.doseTimes).map(doseTime => ({
       time: doseTime,
-      confirmation:
-        logMap.get(`${row.id}:${row.doseDate}:${doseTime}`) ?? null,
+      confirmation: logMap.get(`${row.id}:${row.doseDate}:${doseTime}`) ?? null,
     })),
   }));
 }
@@ -1037,14 +1305,19 @@ export async function createMedication(
     endDate?: string | null;
     notes?: string | null;
     assigneeId?: number | null;
+    escalationRecipientId?: number | null;
   }
 ) {
   const role = await requireMembership(userId, familyId);
   requireWrite(role);
   await requireAssigneeInFamily(input.assigneeId, familyId);
+  await requireEscalationRecipientInFamily(input.escalationRecipientId, familyId);
   const doseTimes = normalizeDoseTimes(input.doseTimes);
   if (!isValidTimeZone(input.timeZone))
-    throw new TRPCError({ code: "BAD_REQUEST", message: "Choose a valid IANA time zone." });
+    throw new TRPCError({
+      code: "BAD_REQUEST",
+      message: "Choose a valid IANA time zone.",
+    });
   const db = await getDb();
   if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
   await db.insert(medications).values({
@@ -1074,6 +1347,7 @@ export async function updateMedication(
     endDate?: string | null;
     notes?: string | null;
     assigneeId?: number | null;
+    escalationRecipientId?: number | null;
     active: boolean;
   }
 ) {
@@ -1100,9 +1374,13 @@ export async function updateMedication(
   )
     throw new TRPCError({ code: "FORBIDDEN" });
   await requireAssigneeInFamily(input.assigneeId, familyId);
+  await requireEscalationRecipientInFamily(input.escalationRecipientId, familyId);
   const doseTimes = normalizeDoseTimes(input.doseTimes);
   if (!isValidTimeZone(input.timeZone))
-    throw new TRPCError({ code: "BAD_REQUEST", message: "Choose a valid IANA time zone." });
+    throw new TRPCError({
+      code: "BAD_REQUEST",
+      message: "Choose a valid IANA time zone.",
+    });
   await db
     .update(medications)
     .set({
@@ -1150,25 +1428,39 @@ export async function confirmDose(
       .limit(1)
       .for("update");
     if (!medication || !medication.active)
-      throw new TRPCError({ code: "NOT_FOUND", message: "This medication is no longer active." });
+      throw new TRPCError({
+        code: "NOT_FOUND",
+        message: "This medication is no longer active.",
+      });
     const timeZone = isValidTimeZone(medication.timeZone)
       ? medication.timeZone
       : "UTC";
     const now = new Date();
     const today = dateKeyInZone(now, timeZone);
     if (doseDate !== today)
-      throw new TRPCError({ code: "BAD_REQUEST", message: "Confirmations are recorded for the medication's current local date only." });
+      throw new TRPCError({
+        code: "BAD_REQUEST",
+        message:
+          "Confirmations are recorded for the medication's current local date only.",
+      });
     if (
       (medication.startDate && today < medication.startDate) ||
       (medication.endDate && today > medication.endDate)
     )
-      throw new TRPCError({ code: "BAD_REQUEST", message: "This medication is outside its active date range." });
+      throw new TRPCError({
+        code: "BAD_REQUEST",
+        message: "This medication is outside its active date range.",
+      });
     if (!storedDoseTimes(medication.doseTimes).includes(doseTime))
-      throw new TRPCError({ code: "BAD_REQUEST", message: "Choose a scheduled dose time." });
+      throw new TRPCError({
+        code: "BAD_REQUEST",
+        message: "Choose a scheduled dose time.",
+      });
     if (!canConfirmDoseAt(doseDate, doseTime, timeZone, now))
       throw new TRPCError({
         code: "BAD_REQUEST",
-        message: "This dose cannot be confirmed before its scheduled local time.",
+        message:
+          "This dose cannot be confirmed before its scheduled local time.",
       });
     const [existing] = await tx
       .select({ id: doseConfirmations.id })
@@ -1197,6 +1489,7 @@ export async function confirmDose(
       confirmedBy: userId,
       confirmedAt: new Date(),
     });
+    await tx.update(notificationEvents).set({ status: "cancelled" }).where(and(eq(notificationEvents.familyId, familyId), eq(notificationEvents.medicationId, medicationId), eq(notificationEvents.doseDate, doseDate), eq(notificationEvents.doseTime, doseTime), or(eq(notificationEvents.status, "created"), eq(notificationEvents.status, "read"))));
     return { success: true };
   });
 }
@@ -1254,13 +1547,14 @@ export async function createEvent(
   const db = await getDb();
   if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
   const { startsAtLocal: _local, ...eventFields } = input;
-  await db.insert(careEvents).values({
+  const [result] = await db.insert(careEvents).values({
     ...eventFields,
     startsAt: resolved.instant,
     familyId,
     createdBy: userId,
     title: input.title.trim(),
   });
+  await db.insert(careAuditLog).values({ familyId, actorId: userId, action: "event.created", resourceType: "event", resourceId: Number((result as { insertId?: number | bigint }).insertId), previousValues: null, newValues: { ...eventFields, title: input.title.trim(), startsAt: resolved.instant } });
   return { success: true };
 }
 
@@ -1293,11 +1587,9 @@ export async function updateEvent(
   if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
   return db.transaction(async tx => {
     const [event] = await tx
-      .select({ id: careEvents.id, createdBy: careEvents.createdBy })
+      .select()
       .from(careEvents)
-      .where(
-        and(eq(careEvents.id, eventId), eq(careEvents.familyId, familyId))
-      )
+      .where(and(eq(careEvents.id, eventId), eq(careEvents.familyId, familyId)))
       .limit(1)
       .for("update");
     if (!event) throw new TRPCError({ code: "NOT_FOUND" });
@@ -1310,6 +1602,7 @@ export async function updateEvent(
       .where(
         and(eq(careEvents.id, eventId), eq(careEvents.familyId, familyId))
       );
+    await recordAudit(tx, { familyId, actorId: userId, action: "event.updated", resourceType: "event", resourceId: eventId, previousValues: { title: event.title, kind: event.kind, startsAt: event.startsAt, timeZone: event.timeZone, location: event.location, escortId: event.escortId, reminderMinutes: event.reminderMinutes, questions: event.questions, visitNotes: event.visitNotes }, newValues: { ...fields, title: input.title.trim(), startsAt: resolved.instant } });
     return { success: true };
   });
 }
@@ -1325,11 +1618,9 @@ export async function deleteEvent(
   if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
   return db.transaction(async tx => {
     const [event] = await tx
-      .select({ id: careEvents.id, createdBy: careEvents.createdBy })
+      .select()
       .from(careEvents)
-      .where(
-        and(eq(careEvents.id, eventId), eq(careEvents.familyId, familyId))
-      )
+      .where(and(eq(careEvents.id, eventId), eq(careEvents.familyId, familyId)))
       .limit(1)
       .for("update");
     if (!event) throw new TRPCError({ code: "NOT_FOUND" });
@@ -1340,6 +1631,7 @@ export async function deleteEvent(
       .where(
         and(eq(careEvents.id, eventId), eq(careEvents.familyId, familyId))
       );
+    await recordAudit(tx, { familyId, actorId: userId, action: "event.deleted", resourceType: "event", resourceId: eventId, previousValues: { title: event.title, kind: event.kind, startsAt: event.startsAt, location: event.location }, newValues: null });
     return { success: true };
   });
 }
@@ -1382,4 +1674,434 @@ export async function createCareNote(
     .insert(careNotes)
     .values({ ...input, familyId, createdBy: userId, body: input.body.trim() });
   return { success: true };
+}
+
+async function requireNeedBuyerInFamily(
+  buyerId: number | null | undefined,
+  familyId: number
+) {
+  if (buyerId == null) return;
+  const db = await getDb();
+  if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
+  const [member] = await db
+    .select({ id: familyMembers.id })
+    .from(familyMembers)
+    .where(
+      and(
+        eq(familyMembers.familyId, familyId),
+        eq(familyMembers.userId, buyerId)
+      )
+    )
+    .limit(1);
+  if (!member)
+    throw new TRPCError({
+      code: "BAD_REQUEST",
+      message: "Choose a current member of this family as the buyer.",
+    });
+}
+
+async function requireResourceEditor(
+  userId: number,
+  role: FamilyRole,
+  createdBy: number
+) {
+  if (!managers.includes(role) && createdBy !== userId)
+    throw new TRPCError({
+      code: "FORBIDDEN",
+      message:
+        "Only the person who added this record or a family coordinator can change it.",
+    });
+}
+
+export async function listHouseholdNeeds(userId: number, familyId: number) {
+  await requireMembership(userId, familyId);
+  const db = await getDb();
+  if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
+  const [rows, familyMembersWithNames] = await Promise.all([
+    db
+      .select()
+      .from(householdNeeds)
+      .where(eq(householdNeeds.familyId, familyId))
+      .orderBy(
+        asc(householdNeeds.completed),
+        desc(householdNeeds.priority),
+        asc(householdNeeds.createdAt)
+      ),
+    db
+      .select({ userId: familyMembers.userId, name: users.name })
+      .from(familyMembers)
+      .innerJoin(users, eq(familyMembers.userId, users.id))
+      .where(eq(familyMembers.familyId, familyId)),
+  ]);
+  const namesByMemberId = new Map(
+    familyMembersWithNames.map(member => [member.userId, member.name])
+  );
+  return rows.map(row => {
+    const buyerIsCurrentMember =
+      row.buyerId != null && namesByMemberId.has(row.buyerId);
+    return {
+      ...row,
+      buyerId: buyerIsCurrentMember ? row.buyerId : null,
+      buyerName: buyerIsCurrentMember
+        ? (namesByMemberId.get(row.buyerId!) ?? null)
+        : null,
+    };
+  });
+}
+
+export async function createHouseholdNeed(
+  userId: number,
+  familyId: number,
+  input: {
+    name: string;
+    quantity?: string | null;
+    priority: "low" | "medium" | "high";
+    buyerId?: number | null;
+  }
+) {
+  const role = await requireMembership(userId, familyId);
+  requireWrite(role);
+  await requireNeedBuyerInFamily(input.buyerId, familyId);
+  const db = await getDb();
+  if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
+  const [result] = await db.insert(householdNeeds).values({
+    ...input,
+    familyId,
+    name: input.name.trim(),
+    quantity: input.quantity?.trim() || null,
+    createdBy: userId,
+  });
+  return {
+    id: Number((result as { insertId?: number | bigint }).insertId),
+    success: true,
+  };
+}
+
+export async function updateHouseholdNeed(
+  userId: number,
+  familyId: number,
+  needId: number,
+  input: {
+    name: string;
+    quantity?: string | null;
+    priority: "low" | "medium" | "high";
+    buyerId?: number | null;
+    completed: boolean;
+  }
+) {
+  const role = await requireMembership(userId, familyId);
+  requireWrite(role);
+  const db = await getDb();
+  if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
+  const [existing] = await db
+    .select()
+    .from(householdNeeds)
+    .where(
+      and(eq(householdNeeds.id, needId), eq(householdNeeds.familyId, familyId))
+    )
+    .limit(1);
+  if (!existing) throw new TRPCError({ code: "NOT_FOUND" });
+  await requireResourceEditor(userId, role, existing.createdBy);
+  await requireNeedBuyerInFamily(input.buyerId, familyId);
+  await db
+    .update(householdNeeds)
+    .set({
+      name: input.name.trim(),
+      quantity: input.quantity?.trim() || null,
+      priority: input.priority,
+      buyerId: input.buyerId ?? null,
+      completed: input.completed,
+    })
+    .where(
+      and(eq(householdNeeds.id, needId), eq(householdNeeds.familyId, familyId))
+    );
+  return { success: true };
+}
+
+export async function deleteHouseholdNeed(
+  userId: number,
+  familyId: number,
+  needId: number
+) {
+  const role = await requireMembership(userId, familyId);
+  requireWrite(role);
+  const db = await getDb();
+  if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
+  const [existing] = await db
+    .select()
+    .from(householdNeeds)
+    .where(
+      and(eq(householdNeeds.id, needId), eq(householdNeeds.familyId, familyId))
+    )
+    .limit(1);
+  if (!existing) throw new TRPCError({ code: "NOT_FOUND" });
+  await requireResourceEditor(userId, role, existing.createdBy);
+  await db
+    .delete(householdNeeds)
+    .where(
+      and(eq(householdNeeds.id, needId), eq(householdNeeds.familyId, familyId))
+    );
+  return { success: true };
+}
+
+type ContactKind = "provider" | "clinic" | "family" | "emergency";
+type ContactFields = {
+  kind: ContactKind;
+  name: string;
+  organization?: string | null;
+  phone?: string | null;
+  email?: string | null;
+  notes?: string | null;
+};
+const cleanContactFields = (input: ContactFields) => ({
+  ...input,
+  name: input.name.trim(),
+  organization: input.organization?.trim() || null,
+  phone: input.phone?.trim() || null,
+  email: input.email?.trim() || null,
+  notes: input.notes?.trim() || null,
+});
+
+export async function listImportantContacts(userId: number, familyId: number) {
+  await requireMembership(userId, familyId);
+  const db = await getDb();
+  if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
+  return db
+    .select()
+    .from(importantContacts)
+    .where(eq(importantContacts.familyId, familyId))
+    .orderBy(asc(importantContacts.kind), asc(importantContacts.name));
+}
+
+export async function createImportantContact(
+  userId: number,
+  familyId: number,
+  input: ContactFields
+) {
+  const role = await requireMembership(userId, familyId);
+  requireWrite(role);
+  const db = await getDb();
+  if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
+  const [result] = await db
+    .insert(importantContacts)
+    .values({ ...cleanContactFields(input), familyId, createdBy: userId });
+  return {
+    id: Number((result as { insertId?: number | bigint }).insertId),
+    success: true,
+  };
+}
+
+export async function updateImportantContact(
+  userId: number,
+  familyId: number,
+  contactId: number,
+  input: ContactFields
+) {
+  const role = await requireMembership(userId, familyId);
+  requireWrite(role);
+  const db = await getDb();
+  if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
+  const [existing] = await db
+    .select()
+    .from(importantContacts)
+    .where(
+      and(
+        eq(importantContacts.id, contactId),
+        eq(importantContacts.familyId, familyId)
+      )
+    )
+    .limit(1);
+  if (!existing) throw new TRPCError({ code: "NOT_FOUND" });
+  await requireResourceEditor(userId, role, existing.createdBy);
+  await db
+    .update(importantContacts)
+    .set(cleanContactFields(input))
+    .where(
+      and(
+        eq(importantContacts.id, contactId),
+        eq(importantContacts.familyId, familyId)
+      )
+    );
+  return { success: true };
+}
+
+export async function deleteImportantContact(
+  userId: number,
+  familyId: number,
+  contactId: number
+) {
+  const role = await requireMembership(userId, familyId);
+  requireWrite(role);
+  const db = await getDb();
+  if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
+  const [existing] = await db
+    .select()
+    .from(importantContacts)
+    .where(
+      and(
+        eq(importantContacts.id, contactId),
+        eq(importantContacts.familyId, familyId)
+      )
+    )
+    .limit(1);
+  if (!existing) throw new TRPCError({ code: "NOT_FOUND" });
+  await requireResourceEditor(userId, role, existing.createdBy);
+  await db
+    .delete(importantContacts)
+    .where(
+      and(
+        eq(importantContacts.id, contactId),
+        eq(importantContacts.familyId, familyId)
+      )
+    );
+  return { success: true };
+}
+
+
+function taskCollaborationSnapshot(task: any) {
+  return {
+    title: task.title,
+    description: task.description ?? null,
+    dueAt: task.dueAt ? new Date(task.dueAt).toISOString() : null,
+    priority: task.priority,
+    assigneeId: task.assigneeId ?? null,
+    status: task.status,
+    recurrence: task.recurrence,
+    notes: task.notes ?? null,
+  };
+}
+
+function storedTaskSnapshot(value: unknown) {
+  if (typeof value !== "string") return value;
+  try {
+    return JSON.parse(value) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+async function requireFamilyUser(tx: any, familyId: number, userId: number) {
+  const [member] = await tx.select({ id: familyMembers.id }).from(familyMembers)
+    .where(and(eq(familyMembers.familyId, familyId), eq(familyMembers.userId, userId))).limit(1);
+  if (!member) throw new TRPCError({ code: "BAD_REQUEST", message: "Choose a current member of this family." });
+}
+
+export async function listCollaborationRequests(userId: number, familyId: number) {
+  await requireMembership(userId, familyId);
+  const db = await getDb();
+  if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
+  return db.select().from(taskCollaborationRequests).where(eq(taskCollaborationRequests.familyId, familyId)).orderBy(desc(taskCollaborationRequests.createdAt)).limit(100);
+}
+
+export async function requestTaskCollaboration(userId: number, familyId: number, taskId: number, targetId: number, kind: "help" | "swap") {
+  const role = await requireMembership(userId, familyId);
+  requireWrite(role);
+  if (userId === targetId) throw new TRPCError({ code: "BAD_REQUEST", message: "Choose another family member." });
+  const db = await getDb();
+  if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
+  return db.transaction(async tx => {
+    const [task] = await tx.select().from(careTasks).where(and(eq(careTasks.id, taskId), eq(careTasks.familyId, familyId))).limit(1).for("update");
+    if (!task) throw new TRPCError({ code: "NOT_FOUND" });
+    if (task.status === "completed") throw new TRPCError({ code: "CONFLICT", message: "Completed tasks cannot be reassigned." });
+    if (kind === "swap" && task.assigneeId !== userId) throw new TRPCError({ code: "FORBIDDEN", message: "Only the current assignee can request a responsibility swap." });
+    await requireFamilyUser(tx, familyId, targetId);
+    const pending = await tx.select({ id: taskCollaborationRequests.id }).from(taskCollaborationRequests).where(and(eq(taskCollaborationRequests.taskId, taskId), eq(taskCollaborationRequests.status, "pending"))).limit(1);
+    if (pending.length) throw new TRPCError({ code: "CONFLICT", message: "A decision is already pending for this task." });
+    const [result] = await tx.insert(taskCollaborationRequests).values({ familyId, taskId, requesterId: userId, targetId, kind, status: "pending", taskSnapshot: taskCollaborationSnapshot(task) });
+    const requestId = Number((result as { insertId?: number | bigint }).insertId);
+    await recordAudit(tx, { familyId, actorId: userId, action: `task.${kind}_requested`, resourceType: "task", resourceId: taskId, previousValues: null, newValues: { requestId, targetId } });
+    return { success: true, requestId };
+  });
+}
+
+export async function respondTaskCollaboration(userId: number, familyId: number, requestId: number, accept: boolean) {
+  await requireMembership(userId, familyId);
+  const db = await getDb();
+  if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
+  return db.transaction(async tx => {
+    const [requestHint] = await tx.select({ taskId: taskCollaborationRequests.taskId }).from(taskCollaborationRequests).where(and(eq(taskCollaborationRequests.id, requestId), eq(taskCollaborationRequests.familyId, familyId))).limit(1);
+    if (!requestHint) throw new TRPCError({ code: "NOT_FOUND" });
+    const [task] = await tx.select().from(careTasks).where(and(eq(careTasks.id, requestHint.taskId), eq(careTasks.familyId, familyId))).limit(1).for("update");
+    if (!task) throw new TRPCError({ code: "NOT_FOUND" });
+    const [request] = await tx.select().from(taskCollaborationRequests).where(and(eq(taskCollaborationRequests.id, requestId), eq(taskCollaborationRequests.familyId, familyId))).limit(1).for("update");
+    if (!request) throw new TRPCError({ code: "NOT_FOUND" });
+    if (request.targetId !== userId) throw new TRPCError({ code: "FORBIDDEN", message: "Only the invited family member may respond." });
+    if (request.status !== "pending") throw new TRPCError({ code: "CONFLICT", message: "This request already has a decision." });
+    await requireFamilyUser(tx, familyId, userId);
+    if (request.taskId !== task.id) throw new TRPCError({ code: "CONFLICT", message: "The request no longer matches this task." });
+    if (task.status === "completed" || JSON.stringify(taskCollaborationSnapshot(task)) !== JSON.stringify(storedTaskSnapshot(request.taskSnapshot)))
+      throw new TRPCError({ code: "CONFLICT", message: "The task changed after this request; ask again using its current details." });
+    const nextStatus = accept ? "accepted" : "declined";
+    if (accept) {
+      const oldAssignee = task.assigneeId ?? null;
+      await tx.update(careTasks).set({ assigneeId: userId }).where(and(eq(careTasks.id, task.id), eq(careTasks.familyId, familyId)));
+      await recordAudit(tx, { familyId, actorId: userId, action: "task.assigned_by_approval", resourceType: "task", resourceId: task.id, previousValues: { assigneeId: oldAssignee }, newValues: { assigneeId: userId, requestId } });
+    }
+    await tx.update(taskCollaborationRequests).set({ status: nextStatus, respondedAt: new Date() }).where(and(eq(taskCollaborationRequests.id, requestId), eq(taskCollaborationRequests.familyId, familyId), eq(taskCollaborationRequests.status, "pending")));
+    await recordAudit(tx, { familyId, actorId: userId, action: `task.${request.kind}_${nextStatus}`, resourceType: "task", resourceId: task.id, previousValues: { requestStatus: "pending" }, newValues: { requestStatus: nextStatus } });
+    return { success: true, accepted: accept };
+  });
+}
+
+export async function listAbsences(userId: number, familyId: number) {
+  await requireMembership(userId, familyId);
+  const db = await getDb();
+  if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
+  const rows = await db.select().from(careAbsences).where(eq(careAbsences.familyId, familyId)).orderBy(asc(careAbsences.startDate)).limit(100);
+  return Promise.all(rows.map(async absence => {
+    const affectedTasks = await db.select({ id: careTasks.id, title: careTasks.title, dueAt: careTasks.dueAt, status: careTasks.status, assigneeId: careTasks.assigneeId }).from(careTasks).where(and(eq(careTasks.familyId, familyId), eq(careTasks.assigneeId, absence.memberId)));
+    return { ...absence, affectedTasks: affectedTasks.filter(task => task.status !== "completed" && (!task.dueAt || (new Date(task.dueAt).toISOString().slice(0, 10) >= absence.startDate && new Date(task.dueAt).toISOString().slice(0, 10) <= absence.endDate))) };
+  }));
+}
+
+export async function createAbsence(userId: number, familyId: number, input: { memberId: number; startDate: string; endDate: string; note?: string | null }) {
+  const role = await requireMembership(userId, familyId);
+  requireWrite(role);
+  if (input.endDate < input.startDate) throw new TRPCError({ code: "BAD_REQUEST", message: "End date must be on or after start date." });
+  const db = await getDb();
+  if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
+  await requireFamilyUser(db, familyId, input.memberId);
+  const [result] = await db.insert(careAbsences).values({ ...input, note: input.note?.trim() || null, familyId, createdBy: userId });
+  await db.insert(careAuditLog).values({ familyId, actorId: userId, action: "absence.recorded", resourceType: "absence", resourceId: Number((result as { insertId?: number | bigint }).insertId), previousValues: null, newValues: { memberId: input.memberId, startDate: input.startDate, endDate: input.endDate } });
+  return { success: true };
+}
+
+export async function listCareAudit(userId: number, familyId: number) {
+  await requireMembership(userId, familyId);
+  const db = await getDb();
+  if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
+  return db.select().from(careAuditLog).where(eq(careAuditLog.familyId, familyId)).orderBy(desc(careAuditLog.createdAt)).limit(200);
+}
+
+export async function listCareHandoffs(userId: number, familyId: number) {
+  await requireMembership(userId, familyId);
+  const db = await getDb();
+  if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
+  const handoffs = await db.select().from(careHandoffs).where(eq(careHandoffs.familyId, familyId)).orderBy(desc(careHandoffs.createdAt)).limit(100);
+  return Promise.all(handoffs.map(async handoff => {
+    const ids = Array.isArray(handoff.pendingTaskIds) ? handoff.pendingTaskIds : [];
+    const pendingTasks = ids.length ? await db.select({ id: careTasks.id, title: careTasks.title, status: careTasks.status, dueAt: careTasks.dueAt }).from(careTasks).where(and(eq(careTasks.familyId, familyId), inArray(careTasks.id, ids))) : [];
+    return { ...handoff, pendingTasks: pendingTasks.filter(task => task.status !== "completed") };
+  }));
+}
+
+export async function createCareHandoff(userId: number, familyId: number, input: { eventId: number; recipientId: number; context: string; pendingTaskIds: number[] }) {
+  const role = await requireMembership(userId, familyId);
+  requireWrite(role);
+  const db = await getDb();
+  if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
+  return db.transaction(async tx => {
+    await requireFamilyUser(tx, familyId, input.recipientId);
+    const [event] = await tx.select({ id: careEvents.id }).from(careEvents).where(and(eq(careEvents.id, input.eventId), eq(careEvents.familyId, familyId), eq(careEvents.kind, "visit"))).limit(1);
+    if (!event) throw new TRPCError({ code: "NOT_FOUND", message: "Choose a family visit from this family." });
+    const taskIds = [...new Set(input.pendingTaskIds)];
+    if (taskIds.length) {
+      const tasks = await tx.select({ id: careTasks.id, status: careTasks.status }).from(careTasks).where(and(eq(careTasks.familyId, familyId), inArray(careTasks.id, taskIds)));
+      if (tasks.length !== taskIds.length || tasks.some(task => task.status === "completed")) throw new TRPCError({ code: "BAD_REQUEST", message: "Choose only pending tasks from this family." });
+    }
+    const [result] = await tx.insert(careHandoffs).values({ familyId, eventId: input.eventId, fromUserId: userId, recipientId: input.recipientId, context: input.context.trim(), pendingTaskIds: taskIds });
+    const id = Number((result as { insertId?: number | bigint }).insertId);
+    await recordAudit(tx, { familyId, actorId: userId, action: "handoff.created", resourceType: "handoff", resourceId: id, previousValues: null, newValues: { recipientId: input.recipientId, eventId: input.eventId, pendingTaskIds: taskIds } });
+    return { success: true, id };
+  });
 }

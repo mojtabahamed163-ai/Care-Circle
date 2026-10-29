@@ -9,6 +9,8 @@ import {
   ChevronDown,
   CircleHelp,
   ClipboardList,
+  ContactRound,
+  ShoppingBasket,
   Clock3,
   Download,
   Heart,
@@ -28,6 +30,8 @@ import CareDialog, {
   type CareDialogMode,
   type FamilyMemberOption,
 } from "@/components/CareDialogs";
+import { CollaborationPanels, HandoffPanel } from "@/components/Phase2Collaboration";
+import Phase3Insights from "@/components/Phase3Insights";
 import { canCoordinateRole, canWriteRole } from "@/lib/care-permissions";
 import { trpc } from "@/lib/trpc";
 import {
@@ -42,6 +46,8 @@ type Tab =
   | "calendar"
   | "medications"
   | "journal"
+  | "needs"
+  | "contacts"
   | "family"
   | "privacy";
 const tabTitles: Record<Tab, string> = {
@@ -50,6 +56,8 @@ const tabTitles: Record<Tab, string> = {
   calendar: "Calendar",
   medications: "Medications",
   journal: "Care journal",
+  needs: "Household needs",
+  contacts: "Important contacts",
   family: "Family circle",
   privacy: "Privacy & safety",
 };
@@ -170,6 +178,10 @@ export default function Home() {
     return value ? Number(value) || null : null;
   });
   const [dialog, setDialog] = useState<CareDialogMode | null>(null);
+  const [needFormOpen, setNeedFormOpen] = useState(false);
+  const [contactFormOpen, setContactFormOpen] = useState(false);
+  const [editingNeedId, setEditingNeedId] = useState<number | null>(null);
+  const [editingContactId, setEditingContactId] = useState<number | null>(null);
   const [busy, setBusy] = useState(false);
   const [inviteLink, setInviteLink] = useState("");
   const [transferTargetId, setTransferTargetId] = useState<number | null>(null);
@@ -197,9 +209,22 @@ export default function Home() {
     families.data?.find(family => family.id === familyId) ?? families.data?.[0];
   const enabled = !!me.data && familyId > 0;
   const tasks = trpc.care.tasks.list.useQuery({ familyId }, { enabled });
-  const medications = trpc.care.medications.list.useQuery({ familyId }, { enabled });
+  const medications = trpc.care.medications.list.useQuery(
+    { familyId },
+    { enabled }
+  );
   const events = trpc.care.events.list.useQuery({ familyId }, { enabled });
   const notes = trpc.care.notes.list.useQuery({ familyId }, { enabled });
+  const needs = trpc.care.householdNeeds.list.useQuery(
+    { familyId },
+    { enabled }
+  );
+  const contacts = trpc.care.importantContacts.list.useQuery(
+    { familyId },
+    { enabled }
+  );
+  const notificationPreferences = trpc.care.phase3.notificationPreferences.useQuery({ familyId }, { enabled });
+  const notificationInbox = trpc.care.phase3.inbox.useQuery({ familyId }, { enabled, refetchInterval: 30_000 });
   const members = trpc.care.families.members.useQuery(
     { familyId },
     { enabled }
@@ -246,6 +271,8 @@ export default function Home() {
             }),
             utils.care.events.list.invalidate({ familyId }),
             utils.care.notes.list.invalidate({ familyId }),
+            utils.care.householdNeeds.list.invalidate({ familyId }),
+            utils.care.importantContacts.list.invalidate({ familyId }),
             utils.care.families.members.invalidate({ familyId }),
             utils.care.families.invitations.invalidate({ familyId }),
           ]
@@ -266,10 +293,18 @@ export default function Home() {
   const createMedication = trpc.care.medications.create.useMutation();
   const updateMedication = trpc.care.medications.update.useMutation();
   const confirmDose = trpc.care.medications.confirm.useMutation();
+  const setNotificationPreferences = trpc.care.phase3.setNotificationPreferences.useMutation();
+  const markNotificationRead = trpc.care.phase3.markNotificationRead.useMutation();
   const createEvent = trpc.care.events.create.useMutation();
   const updateEvent = trpc.care.events.update.useMutation();
   const deleteEvent = trpc.care.events.delete.useMutation();
   const createNote = trpc.care.notes.create.useMutation();
+  const createNeed = trpc.care.householdNeeds.create.useMutation();
+  const updateNeed = trpc.care.householdNeeds.update.useMutation();
+  const deleteNeed = trpc.care.householdNeeds.delete.useMutation();
+  const createContact = trpc.care.importantContacts.create.useMutation();
+  const updateContact = trpc.care.importantContacts.update.useMutation();
+  const deleteContact = trpc.care.importantContacts.delete.useMutation();
   const createInvitation = trpc.care.families.invite.useMutation();
   const acceptInvitation = trpc.care.invitations.accept.useMutation();
   const declineInvitation = trpc.care.invitations.decline.useMutation();
@@ -285,6 +320,8 @@ export default function Home() {
   const medicationRows = medications.data ?? [];
   const eventRows = events.data ?? [];
   const noteRows = notes.data ?? [];
+  const needRows = needs.data ?? [];
+  const contactRows = contacts.data ?? [];
   const memberRows = members.data ?? [];
   const memberOptions: FamilyMemberOption[] = memberRows.map(member => ({
     userId: member.userId,
@@ -313,6 +350,8 @@ export default function Home() {
     medications.error ||
     events.error ||
     notes.error ||
+    needs.error ||
+    contacts.error ||
     members.error;
 
   const signIn = () => {
@@ -386,6 +425,7 @@ export default function Home() {
             | "weekly"
             | "monthly",
           notes: values.notes || null,
+          estimatedMinutes: values.estimatedMinutes ? Number(values.estimatedMinutes) : null,
         };
         if (mode?.item)
           await updateTask.mutateAsync({
@@ -413,6 +453,7 @@ export default function Home() {
           endDate: values.endDate || null,
           notes: values.notes || null,
           assigneeId: assignment,
+          escalationRecipientId: values.escalationRecipientId ? Number(values.escalationRecipientId) : null,
         };
         if (mode?.item)
           await updateMedication.mutateAsync({
@@ -486,8 +527,8 @@ export default function Home() {
           familyId,
           medicationId: dialog.medicationId,
           doseDate:
-            medicationRows.find(med => med.id === dialog.medicationId)?.doseDate ??
-            todayKey(),
+            medicationRows.find(med => med.id === dialog.medicationId)
+              ?.doseDate ?? todayKey(),
           doseTime: dialog.doseTime,
           note: values.note || null,
         });
@@ -521,6 +562,7 @@ export default function Home() {
         assigneeId: task.assigneeId,
         recurrence: task.recurrence,
         notes: task.notes,
+        estimatedMinutes: task.estimatedMinutes,
         status,
       });
       await refresh();
@@ -717,6 +759,8 @@ export default function Home() {
       badge: unconfirmedCount,
     },
     { id: "journal", title: "Care journal", icon: Activity },
+    { id: "needs", title: "Household needs", icon: ShoppingBasket },
+    { id: "contacts", title: "Important contacts", icon: ContactRound },
     { id: "family", title: "Family circle", icon: Users },
   ];
   const canCoordinate = canCoordinateRole(currentFamily?.role);
@@ -744,10 +788,7 @@ export default function Home() {
   const visibleEvents = upcomingEvents.filter(event =>
     calendarRange === "day"
       ? eventLocalDate(event.startsAt, event.timeZone) ===
-        dateKeyInZone(
-          now,
-          eventTimeZone(event.timeZone)
-        )
+        dateKeyInZone(now, eventTimeZone(event.timeZone))
       : new Date(event.startsAt) < weekLimit
   );
   const displayName = me.data.name?.trim().split(/\s+/)[0] || "there";
@@ -885,26 +926,30 @@ export default function Home() {
             {canWrite && activeTab !== "privacy" && activeTab !== "family" && (
               <button
                 className="button button-primary add-button"
-                onClick={() =>
-                  setDialog(
-                    activeTab === "tasks" || activeTab === "home"
-                      ? { kind: "task" }
-                      : activeTab === "medications"
-                        ? { kind: "medication" }
-                        : activeTab === "calendar"
-                          ? { kind: "event" }
-                          : { kind: "note" }
-                  )
-                }
+                onClick={() => {
+                  if (activeTab === "needs") setNeedFormOpen(true);
+                  else if (activeTab === "contacts") setContactFormOpen(true);
+                  else if (activeTab === "tasks" || activeTab === "home")
+                    setDialog({ kind: "task" });
+                  else if (activeTab === "medications")
+                    setDialog({ kind: "medication" });
+                  else if (activeTab === "calendar")
+                    setDialog({ kind: "event" });
+                  else setDialog({ kind: "note" });
+                }}
               >
                 <Plus size={17} />
                 {activeTab === "calendar"
                   ? "Add event"
-                  : activeTab === "medications"
-                    ? "Add medication"
-                    : activeTab === "journal"
-                      ? "Add update"
-                      : "Add task"}
+                  : activeTab === "needs"
+                    ? "Add need"
+                    : activeTab === "contacts"
+                      ? "Add contact"
+                      : activeTab === "medications"
+                        ? "Add medication"
+                        : activeTab === "journal"
+                          ? "Add update"
+                          : "Add task"}
               </button>
             )}
           </div>
@@ -1004,13 +1049,18 @@ export default function Home() {
                     <div className="next-event">
                       <div className="event-date-tile">
                         <span>
-                          {new Date(`${eventLocalDate(nextEvent.startsAt, nextEvent.timeZone)}T12:00:00Z`).toLocaleDateString(
-                            "en-US",
-                            { month: "short", timeZone: "UTC" }
-                          )}
+                          {new Date(
+                            `${eventLocalDate(nextEvent.startsAt, nextEvent.timeZone)}T12:00:00Z`
+                          ).toLocaleDateString("en-US", {
+                            month: "short",
+                            timeZone: "UTC",
+                          })}
                         </span>
                         <strong>
-                          {eventLocalDate(nextEvent.startsAt, nextEvent.timeZone).slice(8, 10)}
+                          {eventLocalDate(
+                            nextEvent.startsAt,
+                            nextEvent.timeZone
+                          ).slice(8, 10)}
                         </strong>
                       </div>
                       <div>
@@ -1020,7 +1070,12 @@ export default function Home() {
                             : "FAMILY VISIT"}
                         </span>
                         <h3>{nextEvent.title}</h3>
-                        <p>{eventDateTime(nextEvent.startsAt, nextEvent.timeZone)}</p>
+                        <p>
+                          {eventDateTime(
+                            nextEvent.startsAt,
+                            nextEvent.timeZone
+                          )}
+                        </p>
                         {nextEvent.location && (
                           <small>{nextEvent.location}</small>
                         )}
@@ -1189,6 +1244,8 @@ export default function Home() {
                 <Users size={14} />
                 {unassignedCount} without an owner
               </div>
+              <CollaborationPanels familyId={familyId} userId={me.data.id} canWrite={canWrite} />
+              <Phase3Insights familyId={familyId} />
             </section>
           )}
 
@@ -1228,12 +1285,19 @@ export default function Home() {
                     <article className="event-row" key={event.id}>
                       <div className="event-date-tile">
                         <span>
-                          {new Date(`${eventLocalDate(event.startsAt, event.timeZone)}T12:00:00Z`).toLocaleDateString(
-                            "en-US",
-                            { month: "short", timeZone: "UTC" }
-                          )}
+                          {new Date(
+                            `${eventLocalDate(event.startsAt, event.timeZone)}T12:00:00Z`
+                          ).toLocaleDateString("en-US", {
+                            month: "short",
+                            timeZone: "UTC",
+                          })}
                         </span>
-                        <strong>{eventLocalDate(event.startsAt, event.timeZone).slice(8, 10)}</strong>
+                        <strong>
+                          {eventLocalDate(event.startsAt, event.timeZone).slice(
+                            8,
+                            10
+                          )}
+                        </strong>
                       </div>
                       <div className="event-row-body">
                         <span className="event-kind">
@@ -1271,16 +1335,26 @@ export default function Home() {
                           <div className="event-actions">
                             <button
                               className="button button-subtle small-button"
-                              onClick={() => setDialog({ kind: "event", item: event })}
+                              onClick={() =>
+                                setDialog({ kind: "event", item: event })
+                              }
                             >
                               Edit
                             </button>
                             <button
                               className="text-danger"
                               onClick={async () => {
-                                if (!window.confirm(`Delete “${event.title}”? This cannot be undone.`)) return;
+                                if (
+                                  !window.confirm(
+                                    `Delete “${event.title}”? This cannot be undone.`
+                                  )
+                                )
+                                  return;
                                 try {
-                                  await deleteEvent.mutateAsync({ familyId, eventId: event.id });
+                                  await deleteEvent.mutateAsync({
+                                    familyId,
+                                    eventId: event.id,
+                                  });
                                   await refresh();
                                   toast.success("Event deleted.");
                                 } catch (error) {
@@ -1317,6 +1391,7 @@ export default function Home() {
                 Each event is shown in its saved time zone. Reminder preferences
                 are saved, but this first stage does not send notifications.
               </p>
+              <HandoffPanel familyId={familyId} canWrite={canWrite} />
             </section>
           )}
 
@@ -1334,6 +1409,14 @@ export default function Home() {
                   local date. Automated reminders are not sent in this stage.
                 </p>
               </div>
+              <section className="panel full-panel">
+                <PanelTitle title="In-app notification settings" caption="Your consent applies to this family only" />
+                <p className="form-hint">Email delivery is not configured. Nothing is sent by email, push, or outside this app. In-app reminders are best-effort and are not guaranteed; this is not an emergency service.</p>
+                <label className="check-field"><input type="checkbox" checked={notificationPreferences.data?.reminderOptIn ?? false} onChange={async e => { try { await setNotificationPreferences.mutateAsync({ familyId, reminderOptIn: e.target.checked, escalationOptIn: notificationPreferences.data?.escalationOptIn ?? false }); await notificationPreferences.refetch(); } catch (error) { showError(error); } }} /><span>Allow in-app dose reminders and 10-minute “not confirmed yet” alerts for me</span></label>
+                <label className="check-field"><input type="checkbox" checked={notificationPreferences.data?.escalationOptIn ?? false} onChange={async e => { try { await setNotificationPreferences.mutateAsync({ familyId, reminderOptIn: notificationPreferences.data?.reminderOptIn ?? false, escalationOptIn: e.target.checked }); await notificationPreferences.refetch(); } catch (error) { showError(error); } }} /><span>I explicitly agree to receive in-app 20-minute dose escalations for this family</span></label>
+                <h3>In-app inbox</h3>
+                {(notificationInbox.data ?? []).length === 0 ? <p className="form-hint">No in-app notifications.</p> : (notificationInbox.data ?? []).map(item => <article className="dose-row" key={item.id}><div className="dose-row-copy"><strong>{item.message}</strong><span>{item.doseDate} · {item.doseTime} · {item.status} · email delivery: {item.emailDeliveryStatus}</span></div>{item.status === "created" && <button className="button button-subtle small-button" onClick={async () => { await markNotificationRead.mutateAsync({ familyId, notificationId: item.id }); await notificationInbox.refetch(); }}>Mark read</button>}</article>)}
+              </section>
               <section className="panel full-panel">
                 <PanelTitle
                   title="Medication list"
@@ -1354,7 +1437,8 @@ export default function Home() {
                             <span
                               className={`confirmation-pill ${med.doses.some(dose => !dose.confirmation) ? "pending" : "confirmed"}`}
                             >
-                              {med.doses.filter(dose => !dose.confirmation).length
+                              {med.doses.filter(dose => !dose.confirmation)
+                                .length
                                 ? `${med.doses.filter(dose => !dose.confirmation).length} dose${med.doses.filter(dose => !dose.confirmation).length === 1 ? "" : "s"} not confirmed`
                                 : "All scheduled doses confirmed"}
                             </span>
@@ -1362,7 +1446,10 @@ export default function Home() {
                           <p className="med-dose">
                             {med.dose} <span>·</span> {med.schedule}
                           </p>
-                          <small>Times follow {med.timeZone} · local date {med.doseDate}</small>
+                          <small>
+                            Times follow {med.timeZone} · local date{" "}
+                            {med.doseDate}
+                          </small>
                           {med.assigneeName && (
                             <small>Point person: {med.assigneeName}</small>
                           )}
@@ -1385,13 +1472,28 @@ export default function Home() {
                                 now
                               );
                               return (
-                                <div className="dose-row" key={`${med.id}-${dose.time}`}>
+                                <div
+                                  className="dose-row"
+                                  key={`${med.id}-${dose.time}`}
+                                >
                                   <div className="dose-row-copy">
-                                    <strong>{dose.time === "once" ? "Daily dose" : dose.time}</strong>
+                                    <strong>
+                                      {dose.time === "once"
+                                        ? "Daily dose"
+                                        : dose.time}
+                                    </strong>
                                     {confirmation ? (
                                       <span className="dose-confirmation-meta">
-                                        {confirmation.status === "confirmed" ? "Confirmed" : "Follow-up needed"} by {confirmation.confirmerName || "a family member"} · {dateTime(confirmation.confirmedAt)}
-                                        {confirmation.note ? ` · ${confirmation.note}` : ""}
+                                        {confirmation.status === "confirmed"
+                                          ? "Confirmed"
+                                          : "Follow-up needed"}{" "}
+                                        by{" "}
+                                        {confirmation.confirmerName ||
+                                          "a family member"}{" "}
+                                        · {dateTime(confirmation.confirmedAt)}
+                                        {confirmation.note
+                                          ? ` · ${confirmation.note}`
+                                          : ""}
                                       </span>
                                     ) : (
                                       <span>
@@ -1405,14 +1507,18 @@ export default function Home() {
                                     <button
                                       className="button button-subtle small-button"
                                       disabled={!canConfirmNow}
-                                      onClick={() => setDialog({
-                                        kind: "dose",
-                                        medicationId: med.id,
-                                        medicationName: med.name,
-                                        doseTime: dose.time,
-                                      })}
+                                      onClick={() =>
+                                        setDialog({
+                                          kind: "dose",
+                                          medicationId: med.id,
+                                          medicationName: med.name,
+                                          doseTime: dose.time,
+                                        })
+                                      }
                                     >
-                                      {canConfirmNow ? "Record confirmation" : `Available at ${dose.time}`}
+                                      {canConfirmNow
+                                        ? "Record confirmation"
+                                        : `Available at ${dose.time}`}
                                     </button>
                                   )}
                                 </div>
@@ -1467,6 +1573,530 @@ export default function Home() {
             </>
           )}
 
+          {activeTab === "needs" && (
+            <section className="panel full-panel">
+              <PanelTitle
+                title="Shared household needs"
+                caption="Items your family has asked to track"
+              />
+              {needs.isLoading ? (
+                <div className="loading-state">
+                  <span className="spinner" />
+                  Loading household needs…
+                </div>
+              ) : needs.error ? (
+                <div className="data-error" role="alert">
+                  Household needs could not be loaded.{" "}
+                  <button
+                    className="text-action"
+                    onClick={() =>
+                      void utils.care.householdNeeds.list.invalidate({
+                        familyId,
+                      })
+                    }
+                  >
+                    Try again
+                  </button>
+                </div>
+              ) : needRows.length ? (
+                <div className="shared-record-list">
+                  {needRows.map(item => (
+                    <article
+                      className={`shared-record ${item.completed ? "record-complete" : ""}`}
+                      key={item.id}
+                    >
+                      <div className="record-copy">
+                        <span
+                          className={`priority-pill priority-${item.priority}`}
+                        >
+                          {item.priority} priority
+                        </span>
+                        <h3>{item.name}</h3>
+                        <p>
+                          {item.quantity || "Quantity not specified"}
+                          {item.buyerName
+                            ? ` · Buyer: ${item.buyerName}`
+                            : " · No buyer assigned"}
+                        </p>
+                      </div>
+                      <div className="record-actions">
+                        {canWrite &&
+                          (canCoordinate || item.createdBy === me.data?.id) && (
+                            <button
+                              className="button button-subtle small-button"
+                              onClick={async () => {
+                                try {
+                                  await updateNeed.mutateAsync({
+                                    familyId,
+                                    needId: item.id,
+                                    name: item.name,
+                                    quantity: item.quantity,
+                                    priority: item.priority,
+                                    buyerId: item.buyerId,
+                                    completed: !item.completed,
+                                  });
+                                  await refresh();
+                                  toast.success(
+                                    item.completed
+                                      ? "Need marked open."
+                                      : "Need marked complete."
+                                  );
+                                } catch (error) {
+                                  showError(error);
+                                }
+                              }}
+                            >
+                              {item.completed ? "Reopen" : "Complete"}
+                            </button>
+                          )}
+                        {canWrite &&
+                          (canCoordinate || item.createdBy === me.data?.id) && (
+                            <button
+                              className="text-action"
+                              onClick={() => {
+                                setEditingNeedId(item.id);
+                                setNeedFormOpen(true);
+                              }}
+                            >
+                              Edit
+                            </button>
+                          )}
+                        {canWrite &&
+                          (canCoordinate || item.createdBy === me.data?.id) && (
+                            <button
+                              className="text-danger"
+                              onClick={async () => {
+                                if (!window.confirm(`Delete “${item.name}”?`))
+                                  return;
+                                try {
+                                  await deleteNeed.mutateAsync({
+                                    familyId,
+                                    needId: item.id,
+                                  });
+                                  await refresh();
+                                  toast.success("Need deleted.");
+                                } catch (error) {
+                                  showError(error);
+                                }
+                              }}
+                            >
+                              Delete
+                            </button>
+                          )}
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              ) : (
+                <EmptyState
+                  icon={ShoppingBasket}
+                  title="No shared needs yet"
+                  body="Add a household item the family wants to remember. Use this list for family-entered items only; it does not make care or medication recommendations."
+                  action={
+                    canWrite ? (
+                      <button
+                        className="button button-primary"
+                        onClick={() => setNeedFormOpen(true)}
+                      >
+                        <Plus size={16} />
+                        Add a need
+                      </button>
+                    ) : undefined
+                  }
+                />
+              )}
+              {needFormOpen && canWrite && (
+                <form
+                  key={editingNeedId ?? "new-need"}
+                  className="shared-form"
+                  onSubmit={async event => {
+                    event.preventDefault();
+                    const data = new FormData(event.currentTarget);
+                    const existing = needRows.find(
+                      row => row.id === editingNeedId
+                    );
+                    const input = {
+                      familyId,
+                      name: String(data.get("name") || "").trim(),
+                      quantity:
+                        String(data.get("quantity") || "").trim() || null,
+                      priority: String(data.get("priority") || "medium") as
+                        | "low"
+                        | "medium"
+                        | "high",
+                      buyerId: Number(data.get("buyerId")) || null,
+                      completed: existing?.completed ?? false,
+                    };
+                    try {
+                      if (editingNeedId)
+                        await updateNeed.mutateAsync({
+                          ...input,
+                          needId: editingNeedId,
+                        });
+                      else await createNeed.mutateAsync(input);
+                      await refresh();
+                      setNeedFormOpen(false);
+                      setEditingNeedId(null);
+                      toast.success(
+                        editingNeedId ? "Need updated." : "Need added."
+                      );
+                    } catch (error) {
+                      showError(error);
+                    }
+                  }}
+                >
+                  <h3>
+                    {editingNeedId
+                      ? "Edit household need"
+                      : "Add a household need"}
+                  </h3>
+                  <label>
+                    Item name
+                    <input
+                      name="name"
+                      required
+                      maxLength={180}
+                      defaultValue={
+                        needRows.find(row => row.id === editingNeedId)?.name
+                      }
+                    />
+                  </label>
+                  <label>
+                    Quantity or size
+                    <input
+                      name="quantity"
+                      maxLength={120}
+                      placeholder="Optional"
+                      defaultValue={
+                        needRows.find(row => row.id === editingNeedId)
+                          ?.quantity ?? ""
+                      }
+                    />
+                  </label>
+                  <label>
+                    Priority
+                    <select
+                      name="priority"
+                      defaultValue={
+                        needRows.find(row => row.id === editingNeedId)
+                          ?.priority ?? "medium"
+                      }
+                    >
+                      <option value="low">Low</option>
+                      <option value="medium">Medium</option>
+                      <option value="high">High</option>
+                    </select>
+                  </label>
+                  <label>
+                    Buyer
+                    <select
+                      name="buyerId"
+                      defaultValue={
+                        needRows.find(row => row.id === editingNeedId)
+                          ?.buyerId ?? ""
+                      }
+                    >
+                      <option value="">Unassigned</option>
+                      {memberOptions.map(member => (
+                        <option key={member.userId} value={member.userId}>
+                          {member.name || "Family member"}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <div className="form-actions">
+                    <button
+                      type="button"
+                      className="button button-subtle"
+                      onClick={() => {
+                        setNeedFormOpen(false);
+                        setEditingNeedId(null);
+                      }}
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      className="button button-primary"
+                      disabled={createNeed.isPending || updateNeed.isPending}
+                    >
+                      Save need
+                    </button>
+                  </div>
+                </form>
+              )}
+              <p className="form-hint calendar-hint">
+                Only family-provided item details are stored here; no medical
+                advice or purchase recommendations are generated.
+              </p>
+            </section>
+          )}
+          {activeTab === "contacts" && (
+            <section className="panel full-panel">
+              <PanelTitle
+                title="Important family contacts"
+                caption="Contact details shared with current family members"
+              />
+              <div className="notice-banner emergency-disclaimer">
+                <span className="notice-icon">
+                  <ShieldCheck size={17} />
+                </span>
+                <p>
+                  <strong>Emergency contact details are not monitored.</strong>{" "}
+                  Care Circle is not an emergency service, does not monitor
+                  these contacts, and cannot guarantee that anyone will respond.
+                  For an emergency, contact local emergency services directly.
+                </p>
+              </div>
+              {contacts.isLoading ? (
+                <div className="loading-state">
+                  <span className="spinner" />
+                  Loading family contacts…
+                </div>
+              ) : contacts.error ? (
+                <div className="data-error" role="alert">
+                  Contacts could not be loaded.{" "}
+                  <button
+                    className="text-action"
+                    onClick={() =>
+                      void utils.care.importantContacts.list.invalidate({
+                        familyId,
+                      })
+                    }
+                  >
+                    Try again
+                  </button>
+                </div>
+              ) : contactRows.length ? (
+                <div className="shared-record-list">
+                  {contactRows.map(item => (
+                    <article className="shared-record" key={item.id}>
+                      <div className="record-copy">
+                        <span className="contact-kind">
+                          {item.kind === "provider"
+                            ? "PROVIDER"
+                            : item.kind === "clinic"
+                              ? "CLINIC"
+                              : item.kind === "family"
+                                ? "FAMILY"
+                                : "EMERGENCY CONTACT"}
+                        </span>
+                        <h3>{item.name}</h3>
+                        {item.organization && <p>{item.organization}</p>}
+                        {item.phone && (
+                          <a href={`tel:${item.phone}`}>{item.phone}</a>
+                        )}
+                        {item.email && (
+                          <a href={`mailto:${item.email}`}>{item.email}</a>
+                        )}
+                        {item.notes && <small>{item.notes}</small>}
+                      </div>
+                      <div className="record-actions">
+                        {canWrite &&
+                          (canCoordinate || item.createdBy === me.data?.id) && (
+                            <button
+                              className="button button-subtle small-button"
+                              onClick={() => {
+                                setEditingContactId(item.id);
+                                setContactFormOpen(true);
+                              }}
+                            >
+                              Edit
+                            </button>
+                          )}
+                        {canWrite && canCoordinate && (
+                          <button
+                            className="text-danger"
+                            onClick={async () => {
+                              if (
+                                !window.confirm(
+                                  `Delete contact “${item.name}”?`
+                                )
+                              )
+                                return;
+                              try {
+                                await deleteContact.mutateAsync({
+                                  familyId,
+                                  contactId: item.id,
+                                });
+                                await refresh();
+                                toast.success("Contact deleted.");
+                              } catch (error) {
+                                showError(error);
+                              }
+                            }}
+                          >
+                            Delete
+                          </button>
+                        )}
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              ) : (
+                <EmptyState
+                  icon={ContactRound}
+                  title="No contacts saved"
+                  body="Add a provider, clinic, family, or emergency contact your family chooses to share."
+                  action={
+                    canWrite ? (
+                      <button
+                        className="button button-primary"
+                        onClick={() => setContactFormOpen(true)}
+                      >
+                        <Plus size={16} />
+                        Add a contact
+                      </button>
+                    ) : undefined
+                  }
+                />
+              )}
+              {contactFormOpen && canWrite && (
+                <form
+                  key={editingContactId ?? "new-contact"}
+                  className="shared-form"
+                  onSubmit={async event => {
+                    event.preventDefault();
+                    const data = new FormData(event.currentTarget);
+                    const input = {
+                      familyId,
+                      kind: String(data.get("kind") || "family") as
+                        | "provider"
+                        | "clinic"
+                        | "family"
+                        | "emergency",
+                      name: String(data.get("name") || "").trim(),
+                      organization:
+                        String(data.get("organization") || "").trim() || null,
+                      phone: String(data.get("phone") || "").trim() || null,
+                      email: String(data.get("email") || "").trim() || null,
+                      notes: String(data.get("notes") || "").trim() || null,
+                    };
+                    try {
+                      if (editingContactId)
+                        await updateContact.mutateAsync({
+                          ...input,
+                          contactId: editingContactId,
+                        });
+                      else await createContact.mutateAsync(input);
+                      await refresh();
+                      setContactFormOpen(false);
+                      setEditingContactId(null);
+                      toast.success(
+                        editingContactId ? "Contact updated." : "Contact added."
+                      );
+                    } catch (error) {
+                      showError(error);
+                    }
+                  }}
+                >
+                  <h3>
+                    {editingContactId
+                      ? "Edit family contact"
+                      : "Add an important contact"}
+                  </h3>
+                  <label>
+                    Type
+                    <select
+                      name="kind"
+                      defaultValue={
+                        contactRows.find(row => row.id === editingContactId)
+                          ?.kind ?? "family"
+                      }
+                    >
+                      <option value="provider">Provider</option>
+                      <option value="clinic">Clinic</option>
+                      <option value="family">Family</option>
+                      <option value="emergency">Emergency contact</option>
+                    </select>
+                  </label>
+                  <label>
+                    Name
+                    <input
+                      name="name"
+                      required
+                      maxLength={180}
+                      defaultValue={
+                        contactRows.find(row => row.id === editingContactId)
+                          ?.name
+                      }
+                    />
+                  </label>
+                  <label>
+                    Organization
+                    <input
+                      name="organization"
+                      maxLength={180}
+                      defaultValue={
+                        contactRows.find(row => row.id === editingContactId)
+                          ?.organization ?? ""
+                      }
+                    />
+                  </label>
+                  <label>
+                    Phone
+                    <input
+                      name="phone"
+                      type="tel"
+                      maxLength={80}
+                      defaultValue={
+                        contactRows.find(row => row.id === editingContactId)
+                          ?.phone ?? ""
+                      }
+                    />
+                  </label>
+                  <label>
+                    Email
+                    <input
+                      name="email"
+                      type="email"
+                      maxLength={320}
+                      defaultValue={
+                        contactRows.find(row => row.id === editingContactId)
+                          ?.email ?? ""
+                      }
+                    />
+                  </label>
+                  <label>
+                    Family-entered note
+                    <textarea
+                      name="notes"
+                      maxLength={1000}
+                      rows={3}
+                      defaultValue={
+                        contactRows.find(row => row.id === editingContactId)
+                          ?.notes ?? ""
+                      }
+                    />
+                  </label>
+                  <div className="form-actions">
+                    <button
+                      type="button"
+                      className="button button-subtle"
+                      onClick={() => {
+                        setContactFormOpen(false);
+                        setEditingContactId(null);
+                      }}
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      className="button button-primary"
+                      disabled={
+                        createContact.isPending || updateContact.isPending
+                      }
+                    >
+                      Save contact
+                    </button>
+                  </div>
+                </form>
+              )}
+              <p className="form-hint calendar-hint">
+                These are user-entered directory details, visible to current
+                members of this family. They are not checked or monitored by the
+                app.
+              </p>
+            </section>
+          )}
           {activeTab === "journal" && (
             <section className="panel full-panel">
               <PanelTitle
@@ -1769,7 +2399,12 @@ export default function Home() {
                     <ClipboardList size={17} /> Information stored
                   </h3>
                   <p>
-                    The app stores account identifiers and profile details, family names and membership roles, invitation records, and the care information you enter: tasks, medication names and prescribed-dose notes, dose schedules and confirmations, appointments, and journal entries. Do not enter details you are not authorized to share.
+                    The app stores account identifiers and profile details,
+                    family names and membership roles, invitation records, and
+                    the care information you enter: tasks, medication names and
+                    prescribed-dose notes, dose schedules and confirmations,
+                    appointments, and journal entries. Do not enter details you
+                    are not authorized to share.
                   </p>
                 </article>
                 <article>
@@ -1777,7 +2412,11 @@ export default function Home() {
                     <Heart size={17} /> Purpose and access
                   </h3>
                   <p>
-                    Information is used to coordinate care within the selected family space. Signed-in family members with active membership can view shared records; server-side role checks control write, management, and export actions. Invite links grant access only after the invited person accepts.
+                    Information is used to coordinate care within the selected
+                    family space. Signed-in family members with active
+                    membership can view shared records; server-side role checks
+                    control write, management, and export actions. Invite links
+                    grant access only after the invited person accepts.
                   </p>
                 </article>
                 <article>
@@ -1785,7 +2424,12 @@ export default function Home() {
                     <ShieldCheck size={17} /> Storage and sharing
                   </h3>
                   <p>
-                    Care Circle stores shared records in its application database and processes sign-in through the configured Manus account service. This version does not send family invitations or medication reminders by email and does not use a paid AI service. The platform’s own service terms and safeguards also apply.
+                    Care Circle stores shared records in its application
+                    database and processes sign-in through the configured Manus
+                    account service. This version does not send family
+                    invitations or medication reminders by email and does not
+                    use a paid AI service. The platform’s own service terms and
+                    safeguards also apply.
                   </p>
                 </article>
                 <article>
@@ -1793,7 +2437,11 @@ export default function Home() {
                     <Download size={17} /> Export and retention
                   </h3>
                   <p>
-                    An owner or coordinator can download the selected family’s shared records as JSON. Shared records are retained for family continuity until handled through available in-product actions. No separate backup or recovery promise is made by this policy.
+                    An owner or coordinator can download the selected family’s
+                    shared records as JSON. Shared records are retained for
+                    family continuity until handled through available in-product
+                    actions. No separate backup or recovery promise is made by
+                    this policy.
                   </p>
                 </article>
                 <article>
@@ -1849,7 +2497,14 @@ export default function Home() {
               <section className="account-deletion">
                 <h3>Delete your Care Circle account</h3>
                 <p>
-                  Deletion removes your Care Circle profile and sign-in identifier, removes your family memberships, clears your personal task assignments, and cancels your pending invitations. Shared family history is retained; direct authorship is replaced with “Former family member,” and the text you entered may remain visible to the family. Ownership must be transferred for every family you own before deletion can proceed. This does not delete your Manus account.
+                  Deletion removes your Care Circle profile and sign-in
+                  identifier, removes your family memberships, clears your
+                  personal task assignments, and cancels your pending
+                  invitations. Shared family history is retained; direct
+                  authorship is replaced with “Former family member,” and the
+                  text you entered may remain visible to the family. Ownership
+                  must be transferred for every family you own before deletion
+                  can proceed. This does not delete your Manus account.
                 </p>
                 <button
                   className="button button-danger"
@@ -1873,14 +2528,22 @@ export default function Home() {
                     }
                   }}
                 >
-                  {deleteAccount.isPending ? "Deleting account…" : "Delete my account"}
+                  {deleteAccount.isPending
+                    ? "Deleting account…"
+                    : "Delete my account"}
                 </button>
                 <small>
-                  If you own a family, transfer ownership first. If you sign in again later with the same Manus identity, a new Care Circle account may be created.
+                  If you own a family, transfer ownership first. If you sign in
+                  again later with the same Manus identity, a new Care Circle
+                  account may be created.
                 </small>
               </section>
               <p className="privacy-implementation-note">
-                This in-product privacy disclosure describes this version’s behavior. It is not legal advice or a legal review, and Care Circle does not claim HIPAA compliance. Care Circle is not a medical, clinical, or emergency service. For emergencies, contact local emergency services.
+                This in-product privacy disclosure describes this version’s
+                behavior. It is not legal advice or a legal review, and Care
+                Circle does not claim HIPAA compliance. Care Circle is not a
+                medical, clinical, or emergency service. For emergencies,
+                contact local emergency services.
               </p>
             </section>
           )}
@@ -1941,6 +2604,8 @@ function pageSubtitle(tab: Tab) {
     medications:
       "A shared family record of prescribed schedules and confirmations.",
     journal: "Leave useful context for the next person stepping in.",
+    needs: "Keep a shared record of household items and who will get them.",
+    contacts: "A family-entered directory for important people and services.",
     family: "The people who share access to this family space.",
     privacy: "What this first-stage app does—and what it does not do.",
   };
@@ -2132,6 +2797,7 @@ function TaskRow({
     status: string;
     recurrence: string;
     notes: string | null;
+    estimatedMinutes: number | null;
     completedByName: string | null;
     completedAt: Date | null;
     completionHistory: Array<{
@@ -2160,6 +2826,7 @@ function TaskRow({
         {task.recurrence !== "none" && (
           <span className="repeat-tag">Repeats {task.recurrence}</span>
         )}
+        {task.estimatedMinutes != null && <span>{task.estimatedMinutes} min est.</span>}
         {task.status === "in_progress" && (
           <span className="in-progress-tag">In progress</span>
         )}
