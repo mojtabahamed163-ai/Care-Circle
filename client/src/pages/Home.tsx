@@ -539,7 +539,7 @@ export default function Home() {
         );
       }
       await refresh();
-      if (kind !== "invite") setDialog(null);
+      setDialog(null);
     } catch (error) {
       showError(error);
     } finally {

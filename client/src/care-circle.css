@@ -2595,6 +2595,25 @@ textarea:focus-visible {
   .shared-form .form-actions {
     flex-wrap: wrap;
   }
+  .shared-form label,
+  .phase2-inline-form label {
+    font-size: 13px;
+  }
+  .shared-form input:not([type="checkbox"]),
+  .shared-form select,
+  .shared-form textarea,
+  .phase2-inline-form input,
+  .phase2-inline-form select,
+  .phase2-inline-form textarea,
+  .record-form input:not([type="checkbox"]),
+  .record-form select,
+  .record-form textarea {
+    min-height: 44px;
+    font-size: 16px;
+  }
+  .phase3-toggle {
+    font-size: 14px;
+  }
   .emergency-disclaimer {
     padding: 10px;
   }
