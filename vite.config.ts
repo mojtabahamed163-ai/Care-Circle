@@ -248,6 +248,29 @@ export default defineConfig({
   build: {
     outDir: path.resolve(import.meta.dirname, "dist/public"),
     emptyOutDir: true,
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (!id.includes("node_modules")) return undefined;
+          if (id.includes("lucide-react")) return "vendor-icons";
+          if (id.includes("recharts") || id.includes("d3-")) {
+            return "vendor-charts";
+          }
+          if (
+            id.includes("streamdown") ||
+            id.includes("remark") ||
+            id.includes("unified")
+          ) {
+            return "vendor-markdown";
+          }
+          if (id.includes("@radix-ui")) return "vendor-radix";
+          if (id.includes("react") || id.includes("scheduler")) {
+            return "vendor-react";
+          }
+          return "vendor-core";
+        },
+      },
+    },
   },
   server: {
     host: true,

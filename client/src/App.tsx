@@ -1,21 +1,34 @@
+import { lazy, Suspense } from "react";
 import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import NotFound from "@/pages/NotFound";
 import { Route, Switch } from "wouter";
 import ErrorBoundary from "./components/ErrorBoundary";
 import { ThemeProvider } from "./contexts/ThemeContext";
-import Home from "./pages/Home";
+
+const Home = lazy(() => import("./pages/Home"));
+const NotFound = lazy(() => import("@/pages/NotFound"));
+
+function RouteLoading() {
+  return (
+    <div className="loading-state" role="status" aria-live="polite">
+      <span className="spinner" />
+      <span>Loading Care Circle…</span>
+    </div>
+  );
+}
 
 function Router() {
   // make sure to consider if you need authentication for certain routes
   return (
-    <Switch>
-      <Route path={"/"} component={Home} />
-      <Route path={"/invite/:token"} component={Home} />
-      <Route path={"/404"} component={NotFound} />
-      {/* Final fallback route */}
-      <Route component={NotFound} />
-    </Switch>
+    <Suspense fallback={<RouteLoading />}>
+      <Switch>
+        <Route path={"/"} component={Home} />
+        <Route path={"/invite/:token"} component={Home} />
+        <Route path={"/404"} component={NotFound} />
+        {/* Final fallback route */}
+        <Route component={NotFound} />
+      </Switch>
+    </Suspense>
   );
 }
 

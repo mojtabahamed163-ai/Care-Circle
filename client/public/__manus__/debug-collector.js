@@ -33,6 +33,16 @@
     // An unavailable Runtime must not prevent the existing collector from loading.
   }
 
+  function sanitizeText(value, maxLength) {
+    var text = String(value == null ? "" : value);
+    text = text
+      .replace(/[\w.%+-]+@[\w.-]+\.[A-Za-z]{2,}/g, "[REDACTED_EMAIL]")
+      .replace(/\/invite\/[^/?#\s]+/gi, "/invite/[REDACTED]")
+      .replace(/\b(?:Bearer\s+)?[A-Za-z0-9._~-]{24,}\b/g, "[REDACTED_TOKEN]");
+    var limit = maxLength || 4096;
+    return text.length > limit ? text.slice(0, limit) + "...[truncated]" : text;
+  }
+
   function captureEarlyError(from, message, callStack, timestamp) {
     try {
       var errors = window.__MANUS_RUNTIME_EARLY_ERRORS__;
@@ -40,8 +50,8 @@
       if (!Array.isArray(errors) || errors.length >= 50) return;
       errors.push({
         from: from,
-        message: String(message || "Unknown error").slice(0, 4096),
-        callStack: String(callStack || "").slice(0, 8192),
+        message: sanitizeText(message || "Unknown error", 4096),
+        callStack: sanitizeText(callStack || "", 8192),
         time: new Date(timestamp).toISOString(),
         timeZone: String(
           Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"
@@ -86,7 +96,7 @@
       }
       captureEarlyError(
         "console",
-        message.trim(),
+        sanitizeText(message.trim()),
         callStack || fallbackStack,
         timestamp
       );
@@ -218,6 +228,10 @@
     }
   }
 
+  function redactNetworkValue(url, value) {
+    return isPrivateApiUrl(url) ? "[REDACTED]" : sanitizeValue(value);
+  }
+
   function formatArg(arg) {
     try {
       if (arg instanceof Error) {
@@ -228,7 +242,7 @@
         });
       }
       if (typeof arg === "object") return sanitizeValue(arg);
-      return String(arg);
+      return sanitizeText(arg, 1000);
     } catch (e) {
       return "[Unserializable]";
     }
@@ -251,6 +265,17 @@
     } catch (e) {
       return str;
     }
+  }
+
+  if (window.__MANUS_DEBUG_COLLECTOR_TEST__) {
+    window.__MANUS_DEBUG_COLLECTOR_TEST_HOOKS__ = {
+      sanitizeText: sanitizeText,
+      sanitizeValue: sanitizeValue,
+      safeUrl: safeUrl,
+      isPrivateApiUrl: isPrivateApiUrl,
+      redactNetworkValue: redactNetworkValue,
+    };
+    return;
   }
 
   // ==========================================================================
@@ -538,8 +563,8 @@
       args: [
         {
           type: "UncaughtError",
-          message: event.message,
-          filename: event.filename,
+          message: sanitizeText(event.message),
+          filename: safeUrl(event.filename),
           lineno: event.lineno,
           colno: event.colno,
           stack: event.error ? event.error.stack : null,
@@ -550,7 +575,7 @@
     pruneBuffer(store.consoleLogs, CONFIG.bufferSize.console);
     captureEarlyError(
       "window",
-      event.message,
+      sanitizeText(event.message),
       (event.error && event.error.stack) ||
         "at " + event.filename + ":" + event.lineno + ":" + event.colno,
       timestamp
@@ -558,8 +583,8 @@
 
     // Mark an error moment in UI event stream for agents
     logUiEvent("error", {
-      message: event.message,
-      filename: event.filename,
+      message: sanitizeText(event.message),
+      filename: safeUrl(event.filename),
       lineno: event.lineno,
       colno: event.colno,
     });
@@ -573,7 +598,9 @@
       args: [
         {
           type: "UnhandledRejection",
-          reason: reason && reason.message ? reason.message : String(reason),
+          reason: sanitizeText(
+            reason && reason.message ? reason.message : String(reason)
+          ),
           stack: reason && reason.stack ? reason.stack : null,
         },
       ],
@@ -582,7 +609,9 @@
     pruneBuffer(store.consoleLogs, CONFIG.bufferSize.console);
 
     logUiEvent("unhandledrejection", {
-      reason: reason && reason.message ? reason.message : String(reason),
+      reason: sanitizeText(
+        reason && reason.message ? reason.message : String(reason)
+      ),
     });
   });
 
@@ -625,14 +654,11 @@
       method: method.toUpperCase(),
       url: safeUrl(url),
       request: {
-        headers: isPrivateApiUrl(url)
-          ? "[REDACTED]"
-          : sanitizeValue(requestHeaders),
-        body: isPrivateApiUrl(url)
-          ? "[REDACTED]"
-          : init.body
-            ? sanitizeValue(tryParseJson(init.body))
-            : null,
+        headers: redactNetworkValue(url, requestHeaders),
+        body: redactNetworkValue(
+          url,
+          init.body ? tryParseJson(init.body) : null
+        ),
       },
       response: null,
       duration: null,
@@ -651,10 +677,11 @@
         entry.response = {
           status: response.status,
           statusText: response.statusText,
-          headers: isPrivateApiUrl(url)
-            ? "[REDACTED]"
-            : sanitizeValue(Object.fromEntries(response.headers.entries())),
-          body: isPrivateApiUrl(url) ? "[REDACTED]" : null,
+          headers: redactNetworkValue(
+            url,
+            Object.fromEntries(response.headers.entries())
+          ),
+          body: redactNetworkValue(url, null),
         };
 
         // Semantic network hint for agents on failures (sync, no need to wait for body)
@@ -723,7 +750,7 @@
           .text()
           .then(function (text) {
             if (text.length <= CONFIG.maxBodyLength) {
-              entry.response.body = sanitizeValue(tryParseJson(text));
+              entry.response.body = redactNetworkValue(url, tryParseJson(text));
             } else {
               entry.response.body =
                 text.slice(0, CONFIG.maxBodyLength) + "...[truncated]";
@@ -743,7 +770,7 @@
       .catch(function (error) {
         entry.duration = Date.now() - startTime;
         entry.error = sanitizeValue({
-          message: error.message,
+          message: sanitizeText(error.message),
           stack: error.stack,
         });
 
@@ -754,7 +781,7 @@
           kind: "fetch",
           method: entry.method,
           url: entry.url,
-          message: error.message,
+          message: sanitizeText(error.message),
         });
 
         throw error;
@@ -786,19 +813,16 @@
       xhr._manusData.url.indexOf("/__manus__/") !== 0
     ) {
       xhr._manusData.startTime = Date.now();
-      xhr._manusData.requestBody = isPrivateApiUrl(xhr._manusData.url)
-        ? "[REDACTED]"
-        : body
-          ? sanitizeValue(tryParseJson(body))
-          : null;
+      xhr._manusData.requestBody = redactNetworkValue(
+        xhr._manusData.url,
+        body ? tryParseJson(body) : null
+      );
 
       xhr.addEventListener("load", function () {
         var contentType = (
           xhr.getResponseHeader("content-type") || ""
         ).toLowerCase();
-        var responseBody = isPrivateApiUrl(xhr._manusData.url)
-          ? "[REDACTED]"
-          : null;
+        var responseBody = redactNetworkValue(xhr._manusData.url, null);
 
         // Skip body capture for streaming responses
         var isStreaming =
@@ -829,7 +853,10 @@
               responseBody =
                 text.slice(0, CONFIG.maxBodyLength) + "...[truncated]";
             } else {
-              responseBody = sanitizeValue(tryParseJson(text));
+              responseBody = redactNetworkValue(
+                xhr._manusData.url,
+                tryParseJson(text)
+              );
             }
           } catch (e) {
             // responseText may throw for non-text responses
