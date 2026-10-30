@@ -12,3 +12,7 @@ Start with the Webdev skill's default-template guide. Platform login, storage, p
 `server/_core/publicConfig.ts` exposes only named public runtime values. Private keys stay server-side. The platform serves managed `/manus-storage/` assets; the application does not register a second proxy.
 
 Platform configuration is readable and editable through `webdev.config`. Default settings are initial values, not enforced constraints. The agent may modify the files, commands and configuration or follow the flexible guide for another stack.
+
+## Maintenance documentation
+
+The independent maintenance runbook is in [`docs/CARE-CIRCLE-MAINTENANCE.md`](docs/CARE-CIRCLE-MAINTENANCE.md). The security and privacy review is in [`docs/SECURITY-PRIVACY-REVIEW.md`](docs/SECURITY-PRIVACY-REVIEW.md), and the measured Vite build warnings are documented in [`docs/BUILD-PERFORMANCE.md`](docs/BUILD-PERFORMANCE.md). These documents contain no secrets and describe the current limitations honestly; they do not replace an OAuth, production-device, notification, or legal review.

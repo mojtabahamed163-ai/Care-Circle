@@ -6,7 +6,9 @@
  * 2) Network requests (fetch + XHR)
  * 3) User interactions (semantic uiEvents: click/type/submit/nav/scroll/etc.)
  *
- * Data is periodically sent to /__manus__/logs
+ * Data is periodically sent to /__manus__/logs. API request/response bodies
+ * and headers are intentionally not recorded; the development endpoint also
+ * accepts same-origin payloads only and enforces a size limit.
  * Note: uiEvents are mirrored to sessionEvents for sessionReplay.log
  */
 (function () {
@@ -20,7 +22,11 @@
   try {
     window.__MANUS_RUNTIME_EARLY_ERRORS__ = [];
     var runtime = window.ManusWebEditRuntime;
-    if (runtime && typeof runtime.getState === "function" && runtime.getState().mounted) {
+    if (
+      runtime &&
+      typeof runtime.getState === "function" &&
+      runtime.getState().mounted
+    ) {
       delete window.__MANUS_RUNTIME_EARLY_ERRORS__;
     }
   } catch {
@@ -37,7 +43,9 @@
         message: String(message || "Unknown error").slice(0, 4096),
         callStack: String(callStack || "").slice(0, 8192),
         time: new Date(timestamp).toISOString(),
-        timeZone: String(Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC").slice(0, 128),
+        timeZone: String(
+          Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"
+        ).slice(0, 128),
       });
     } catch {
       // Capturing a diagnostic must never break the original console/error path.
@@ -76,7 +84,12 @@
         }
         message += (stringFormat || message ? " " : "") + String(arg);
       }
-      captureEarlyError("console", message.trim(), callStack || fallbackStack, timestamp);
+      captureEarlyError(
+        "console",
+        message.trim(),
+        callStack || fallbackStack,
+        timestamp
+      );
     } catch {
       // Preserve console.error even for arguments with unusual string conversion.
     }
@@ -102,6 +115,20 @@
       "authorization",
       "cookie",
       "session",
+      "dose",
+      "notes",
+      "visitnotes",
+      "questions",
+      "phone",
+      "email",
+      "location",
+      "context",
+      "description",
+      "appointment",
+      "medication",
+      "schedule",
+      "startdate",
+      "enddate",
     ],
     maxBodyLength: 10240,
     // UI event logging privacy policy:
@@ -135,7 +162,9 @@
     if (value === undefined) return undefined;
 
     if (typeof value === "string") {
-      return value.length > 1000 ? value.slice(0, 1000) + "...[truncated]" : value;
+      return value.length > 1000
+        ? value.slice(0, 1000) + "...[truncated]"
+        : value;
     }
 
     if (typeof value !== "object") return value;
@@ -162,10 +191,41 @@
     return sanitized;
   }
 
+  function safeUrl(value) {
+    try {
+      var parsed = new URL(String(value), window.location.origin);
+      parsed.search = "";
+      parsed.hash = "";
+      parsed.pathname = parsed.pathname.replace(
+        /\/invite\/[^/]+/i,
+        "/invite/[REDACTED]"
+      );
+      return parsed.toString();
+    } catch (e) {
+      return "[URL REDACTED]";
+    }
+  }
+
+  function isPrivateApiUrl(value) {
+    try {
+      var pathname = new URL(String(value), window.location.origin).pathname;
+      return (
+        pathname.indexOf("/api/") === 0 ||
+        pathname.indexOf("/manus-storage/") === 0
+      );
+    } catch (e) {
+      return true;
+    }
+  }
+
   function formatArg(arg) {
     try {
       if (arg instanceof Error) {
-        return { type: "Error", message: arg.message, stack: arg.stack };
+        return sanitizeValue({
+          type: "Error",
+          message: arg.message,
+          stack: arg.stack,
+        });
       }
       if (typeof arg === "object") return sanitizeValue(arg);
       return String(arg);
@@ -245,7 +305,7 @@
       getAttr("data-test") ||
       null;
 
-    var type = tag === "input" ? (getAttr("type") || "text") : null;
+    var type = tag === "input" ? getAttr("type") || "text" : null;
     var href = tag === "a" ? getAttr("href") || null : null;
 
     // a small, stable hint for agents (avoid building full CSS paths)
@@ -264,7 +324,7 @@
       ariaLabel: ariaLabel,
       testId: testId,
       dataLoc: dataLoc,
-      href: href,
+      href: href ? safeUrl(href) : null,
       text: elText(el),
       selectorHint: selectorHint,
     };
@@ -300,7 +360,8 @@
 
     if (isSensitiveField(el)) return { masked: true, length: v.length };
 
-    if (v.length > CONFIG.uiInputMaxLen) v = v.slice(0, CONFIG.uiInputMaxLen) + "…";
+    if (v.length > CONFIG.uiInputMaxLen)
+      v = v.slice(0, CONFIG.uiInputMaxLen) + "…";
     return v;
   }
 
@@ -308,7 +369,7 @@
     var entry = {
       timestamp: Date.now(),
       kind: kind,
-      url: location.href,
+      url: safeUrl(location.href),
       viewport: { width: window.innerWidth, height: window.innerHeight },
       payload: sanitizeValue(payload),
     };
@@ -490,7 +551,8 @@
     captureEarlyError(
       "window",
       event.message,
-      event.error && event.error.stack || "at " + event.filename + ":" + event.lineno + ":" + event.colno,
+      (event.error && event.error.stack) ||
+        "at " + event.filename + ":" + event.lineno + ":" + event.colno,
       timestamp
     );
 
@@ -534,9 +596,10 @@
     init = init || {};
     var startTime = Date.now();
     // Handle string, Request object, or URL object
-    var url = typeof input === "string"
-      ? input
-      : (input && (input.url || input.href || String(input))) || "";
+    var url =
+      typeof input === "string"
+        ? input
+        : (input && (input.url || input.href || String(input))) || "";
     var method = init.method || (input && input.method) || "GET";
 
     // Don't intercept internal requests
@@ -548,7 +611,9 @@
     var requestHeaders = {};
     try {
       if (init.headers) {
-        requestHeaders = Object.fromEntries(new Headers(init.headers).entries());
+        requestHeaders = Object.fromEntries(
+          new Headers(init.headers).entries()
+        );
       }
     } catch (e) {
       requestHeaders = { _parseError: true };
@@ -558,10 +623,16 @@
       timestamp: startTime,
       type: "fetch",
       method: method.toUpperCase(),
-      url: url,
+      url: safeUrl(url),
       request: {
-        headers: requestHeaders,
-        body: init.body ? sanitizeValue(tryParseJson(init.body)) : null,
+        headers: isPrivateApiUrl(url)
+          ? "[REDACTED]"
+          : sanitizeValue(requestHeaders),
+        body: isPrivateApiUrl(url)
+          ? "[REDACTED]"
+          : init.body
+            ? sanitizeValue(tryParseJson(init.body))
+            : null,
       },
       response: null,
       duration: null,
@@ -572,14 +643,18 @@
       .then(function (response) {
         entry.duration = Date.now() - startTime;
 
-        var contentType = (response.headers.get("content-type") || "").toLowerCase();
+        var contentType = (
+          response.headers.get("content-type") || ""
+        ).toLowerCase();
         var contentLength = response.headers.get("content-length");
 
         entry.response = {
           status: response.status,
           statusText: response.statusText,
-          headers: Object.fromEntries(response.headers.entries()),
-          body: null,
+          headers: isPrivateApiUrl(url)
+            ? "[REDACTED]"
+            : sanitizeValue(Object.fromEntries(response.headers.entries())),
+          body: isPrivateApiUrl(url) ? "[REDACTED]" : null,
         };
 
         // Semantic network hint for agents on failures (sync, no need to wait for body)
@@ -593,10 +668,19 @@
           });
         }
 
+        // Care data and platform responses are intentionally not copied into
+        // development logs, even when the response is small or non-JSON.
+        if (isPrivateApiUrl(url)) {
+          store.networkRequests.push(entry);
+          pruneBuffer(store.networkRequests, CONFIG.bufferSize.network);
+          return response;
+        }
+
         // Skip body capture for streaming responses (SSE, etc.) to avoid memory leaks
-        var isStreaming = contentType.indexOf("text/event-stream") !== -1 ||
-                          contentType.indexOf("application/stream") !== -1 ||
-                          contentType.indexOf("application/x-ndjson") !== -1;
+        var isStreaming =
+          contentType.indexOf("text/event-stream") !== -1 ||
+          contentType.indexOf("application/stream") !== -1 ||
+          contentType.indexOf("application/x-ndjson") !== -1;
         if (isStreaming) {
           entry.response.body = "[Streaming response - not captured]";
           store.networkRequests.push(entry);
@@ -605,20 +689,25 @@
         }
 
         // Skip body capture for large responses to avoid memory issues
-        if (contentLength && parseInt(contentLength, 10) > CONFIG.maxBodyLength) {
-          entry.response.body = "[Response too large: " + contentLength + " bytes]";
+        if (
+          contentLength &&
+          parseInt(contentLength, 10) > CONFIG.maxBodyLength
+        ) {
+          entry.response.body =
+            "[Response too large: " + contentLength + " bytes]";
           store.networkRequests.push(entry);
           pruneBuffer(store.networkRequests, CONFIG.bufferSize.network);
           return response;
         }
 
         // Skip body capture for binary content types
-        var isBinary = contentType.indexOf("image/") !== -1 ||
-                       contentType.indexOf("video/") !== -1 ||
-                       contentType.indexOf("audio/") !== -1 ||
-                       contentType.indexOf("application/octet-stream") !== -1 ||
-                       contentType.indexOf("application/pdf") !== -1 ||
-                       contentType.indexOf("application/zip") !== -1;
+        var isBinary =
+          contentType.indexOf("image/") !== -1 ||
+          contentType.indexOf("video/") !== -1 ||
+          contentType.indexOf("audio/") !== -1 ||
+          contentType.indexOf("application/octet-stream") !== -1 ||
+          contentType.indexOf("application/pdf") !== -1 ||
+          contentType.indexOf("application/zip") !== -1;
         if (isBinary) {
           entry.response.body = "[Binary content: " + contentType + "]";
           store.networkRequests.push(entry);
@@ -636,7 +725,8 @@
             if (text.length <= CONFIG.maxBodyLength) {
               entry.response.body = sanitizeValue(tryParseJson(text));
             } else {
-              entry.response.body = text.slice(0, CONFIG.maxBodyLength) + "...[truncated]";
+              entry.response.body =
+                text.slice(0, CONFIG.maxBodyLength) + "...[truncated]";
             }
           })
           .catch(function () {
@@ -652,7 +742,10 @@
       })
       .catch(function (error) {
         entry.duration = Date.now() - startTime;
-        entry.error = { message: error.message, stack: error.stack };
+        entry.error = sanitizeValue({
+          message: error.message,
+          stack: error.stack,
+        });
 
         store.networkRequests.push(entry);
         pruneBuffer(store.networkRequests, CONFIG.bufferSize.network);
@@ -693,26 +786,38 @@
       xhr._manusData.url.indexOf("/__manus__/") !== 0
     ) {
       xhr._manusData.startTime = Date.now();
-      xhr._manusData.requestBody = body ? sanitizeValue(tryParseJson(body)) : null;
+      xhr._manusData.requestBody = isPrivateApiUrl(xhr._manusData.url)
+        ? "[REDACTED]"
+        : body
+          ? sanitizeValue(tryParseJson(body))
+          : null;
 
       xhr.addEventListener("load", function () {
-        var contentType = (xhr.getResponseHeader("content-type") || "").toLowerCase();
-        var responseBody = null;
+        var contentType = (
+          xhr.getResponseHeader("content-type") || ""
+        ).toLowerCase();
+        var responseBody = isPrivateApiUrl(xhr._manusData.url)
+          ? "[REDACTED]"
+          : null;
 
         // Skip body capture for streaming responses
-        var isStreaming = contentType.indexOf("text/event-stream") !== -1 ||
-                          contentType.indexOf("application/stream") !== -1 ||
-                          contentType.indexOf("application/x-ndjson") !== -1;
+        var isStreaming =
+          contentType.indexOf("text/event-stream") !== -1 ||
+          contentType.indexOf("application/stream") !== -1 ||
+          contentType.indexOf("application/x-ndjson") !== -1;
 
         // Skip body capture for binary content types
-        var isBinary = contentType.indexOf("image/") !== -1 ||
-                       contentType.indexOf("video/") !== -1 ||
-                       contentType.indexOf("audio/") !== -1 ||
-                       contentType.indexOf("application/octet-stream") !== -1 ||
-                       contentType.indexOf("application/pdf") !== -1 ||
-                       contentType.indexOf("application/zip") !== -1;
+        var isBinary =
+          contentType.indexOf("image/") !== -1 ||
+          contentType.indexOf("video/") !== -1 ||
+          contentType.indexOf("audio/") !== -1 ||
+          contentType.indexOf("application/octet-stream") !== -1 ||
+          contentType.indexOf("application/pdf") !== -1 ||
+          contentType.indexOf("application/zip") !== -1;
 
-        if (isStreaming) {
+        if (isPrivateApiUrl(xhr._manusData.url)) {
+          responseBody = "[REDACTED]";
+        } else if (isStreaming) {
           responseBody = "[Streaming response - not captured]";
         } else if (isBinary) {
           responseBody = "[Binary content: " + contentType + "]";
@@ -721,7 +826,8 @@
           try {
             var text = xhr.responseText || "";
             if (text.length > CONFIG.maxBodyLength) {
-              responseBody = text.slice(0, CONFIG.maxBodyLength) + "...[truncated]";
+              responseBody =
+                text.slice(0, CONFIG.maxBodyLength) + "...[truncated]";
             } else {
               responseBody = sanitizeValue(tryParseJson(text));
             }
@@ -735,7 +841,7 @@
           timestamp: xhr._manusData.startTime,
           type: "xhr",
           method: xhr._manusData.method,
-          url: xhr._manusData.url,
+          url: safeUrl(xhr._manusData.url),
           request: { body: xhr._manusData.requestBody },
           response: {
             status: xhr.status,
@@ -765,7 +871,7 @@
           timestamp: xhr._manusData.startTime,
           type: "xhr",
           method: xhr._manusData.method,
-          url: xhr._manusData.url,
+          url: safeUrl(xhr._manusData.url),
           request: { body: xhr._manusData.requestBody },
           response: null,
           duration: Date.now() - xhr._manusData.startTime,
@@ -895,5 +1001,7 @@
     forceReport: reportLogs,
   };
 
-  console.debug("[Manus] Debug collector initialized (no rrweb, UI events only)");
+  console.debug(
+    "[Manus] Debug collector initialized (no rrweb, UI events only)"
+  );
 })();

@@ -15,6 +15,7 @@ const PROJECT_ROOT = import.meta.dirname;
 const LOG_DIR = path.join(PROJECT_ROOT, ".manus-logs");
 const MAX_LOG_SIZE_BYTES = 1 * 1024 * 1024; // 1MB per log file
 const TRIM_TARGET_BYTES = Math.floor(MAX_LOG_SIZE_BYTES * 0.6); // Trim to 60% to avoid constant re-trimming
+const MAX_DEBUG_PAYLOAD_BYTES = 256 * 1024;
 
 type LogSource = "browserConsole" | "networkRequests" | "sessionReplay";
 
@@ -56,7 +57,7 @@ function writeToLogFile(source: LogSource, entries: unknown[]) {
   const logPath = path.join(LOG_DIR, `${source}.log`);
 
   // Format entries with timestamps
-  const lines = entries.map((entry) => {
+  const lines = entries.map(entry => {
     const ts = new Date().toISOString();
     return `[${ts}] ${JSON.stringify(entry)}`;
   });
@@ -103,6 +104,43 @@ function vitePluginManusDebugCollector(): Plugin {
           return next();
         }
 
+        const origin = req.headers.origin;
+        if (origin && origin !== "null") {
+          try {
+            if (new URL(origin).host !== req.headers.host) {
+              res.writeHead(403, { "Content-Type": "application/json" });
+              res.end(
+                JSON.stringify({ success: false, error: "same-origin only" })
+              );
+              return;
+            }
+          } catch {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({ success: false, error: "invalid origin" })
+            );
+            return;
+          }
+        }
+        if (req.headers["sec-fetch-site"] === "cross-site") {
+          res.writeHead(403, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({ success: false, error: "same-origin only" })
+          );
+          return;
+        }
+        const declaredLength = Number(req.headers["content-length"] ?? 0);
+        if (
+          Number.isFinite(declaredLength) &&
+          declaredLength > MAX_DEBUG_PAYLOAD_BYTES
+        ) {
+          res.writeHead(413, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({ success: false, error: "debug payload too large" })
+          );
+          return;
+        }
+
         const handlePayload = (payload: any) => {
           // Write logs directly to files
           if (payload.consoleLogs?.length > 0) {
@@ -131,11 +169,26 @@ function vitePluginManusDebugCollector(): Plugin {
         }
 
         let body = "";
-        req.on("data", (chunk) => {
-          body += chunk.toString();
+        let receivedBytes = 0;
+        let payloadTooLarge = false;
+        req.on("data", chunk => {
+          receivedBytes += Buffer.byteLength(chunk);
+          if (receivedBytes <= MAX_DEBUG_PAYLOAD_BYTES)
+            body += chunk.toString();
+          else payloadTooLarge = true;
         });
 
         req.on("end", () => {
+          if (payloadTooLarge) {
+            res.writeHead(413, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({
+                success: false,
+                error: "debug payload too large",
+              })
+            );
+            return;
+          }
           try {
             const payload = JSON.parse(body);
             handlePayload(payload);
@@ -163,12 +216,22 @@ function vitePluginPublicPlatformConfig(): Plugin {
       });
     },
     generateBundle() {
-      this.emitFile({ type: "asset", fileName: "api/platform/config.js", source: publicPlatformScript() });
+      this.emitFile({
+        type: "asset",
+        fileName: "api/platform/config.js",
+        source: publicPlatformScript(),
+      });
     },
   };
 }
 
-const plugins = [vitePluginPublicPlatformConfig(), react(), tailwindcss(), jsxLocPlugin(), vitePluginManusDebugCollector()];
+const plugins = [
+  vitePluginPublicPlatformConfig(),
+  react(),
+  tailwindcss(),
+  jsxLocPlugin(),
+  vitePluginManusDebugCollector(),
+];
 
 export default defineConfig({
   plugins,
