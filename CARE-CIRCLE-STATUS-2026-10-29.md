@@ -42,3 +42,8 @@
 [1]: https://manus.im/docs/website-builder/getting-started/usage-and-pricing "Usage and Pricing — Manus Documentation"
 [2]: https://manus.im/docs/website-builder/publishing "Publishing — Manus Documentation"
 [3]: https://help.manus.im/en/articles/13885710-how-does-webdev-billing-work "How does WebDev billing work — Manus Help"
+
+
+## متابعة 30 أكتوبر 2026 — أرشفة التقرير
+
+أُضيف التقرير النهائي ذو الملف الواحد إلى جذر المستودع: `Care-Circle-Project-Report-2026-10-30.docx`. يشمل ما أُنجز وما لم يُنجز ونتائج الفحوص والقيود؛ جرت معاينته بصريًا وسلامة ملف Word تحققت. تاريخ الفحوص التفصيلية هو 29 أكتوبر 2026. تبقى حدود OAuth الحي والهاتف الفعلي والنشر الخارجي كما هي، ولم يُنشر التطبيق.
