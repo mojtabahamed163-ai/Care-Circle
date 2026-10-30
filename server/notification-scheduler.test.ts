@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { planDoseNotifications } from "./notification-scheduler";
+import {
+  DOSE_NOTIFICATION_CATCH_UP_DAYS,
+  planDoseNotifications,
+  recentLocalDoseDates,
+} from "./notification-scheduler";
 
 const base = {
   medicationId: 44,
@@ -91,5 +95,18 @@ describe("dose notification planner", () => {
         now: instant("2026-11-01T05:50:00Z"),
       })
     ).toEqual([]);
+  });
+
+  it("reconciles today and the previous six local dates across month boundaries", () => {
+    expect(DOSE_NOTIFICATION_CATCH_UP_DAYS).toBe(7);
+    expect(recentLocalDoseDates("2026-03-01")).toEqual([
+      "2026-03-01",
+      "2026-02-28",
+      "2026-02-27",
+      "2026-02-26",
+      "2026-02-25",
+      "2026-02-24",
+      "2026-02-23",
+    ]);
   });
 });

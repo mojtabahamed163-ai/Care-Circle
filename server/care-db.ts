@@ -46,7 +46,10 @@ import {
   users,
 } from "../drizzle/schema";
 import { getDb } from "./db";
-import { planDoseNotifications } from "./notification-scheduler";
+import {
+  planDoseNotifications,
+  recentLocalDoseDates,
+} from "./notification-scheduler";
 
 export type FamilyRole = "owner" | "coordinator" | "caregiver" | "viewer";
 const managers: FamilyRole[] = ["owner", "coordinator"];
@@ -431,12 +434,72 @@ export async function setNotificationPreferences(userId: number, familyId: numbe
   await requireMembership(userId, familyId);
   const db = await getDb();
   if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
-  const [row] = await db.select({ id: notificationPreferences.id }).from(notificationPreferences).where(and(eq(notificationPreferences.familyId, familyId), eq(notificationPreferences.userId, userId))).limit(1);
-  if (row) await db.update(notificationPreferences).set({ reminderOptIn, escalationOptIn }).where(and(eq(notificationPreferences.familyId, familyId), eq(notificationPreferences.userId, userId)));
-  else await db.insert(notificationPreferences).values({ familyId, userId, reminderOptIn, escalationOptIn });
-  const revokedKinds = [!reminderOptIn ? or(eq(notificationEvents.kind, "due_reminder"), eq(notificationEvents.kind, "unconfirmed_10m")) : undefined, !escalationOptIn ? eq(notificationEvents.kind, "escalation_20m") : undefined].filter(Boolean);
-  if (revokedKinds.length) await db.update(notificationEvents).set({ status: "cancelled" }).where(and(eq(notificationEvents.familyId, familyId), eq(notificationEvents.recipientId, userId), eq(notificationEvents.status, "created"), or(...revokedKinds as any[])));
-  return { familyId, reminderOptIn, escalationOptIn, emailDeliveryConfigured: false, message: "Saved consent for in-app notifications only. Email delivery is not configured; nothing is sent outside this app." };
+  return db.transaction(async tx => {
+    const revokedKinds = [
+      !reminderOptIn
+        ? or(
+            eq(notificationEvents.kind, "due_reminder"),
+            eq(notificationEvents.kind, "unconfirmed_10m")
+          )
+        : undefined,
+      !escalationOptIn
+        ? eq(notificationEvents.kind, "escalation_20m")
+        : undefined,
+    ].filter(Boolean);
+
+    // Use the same medication-first lock order as reconciliation. If a worker
+    // already planned an event, this transaction waits and cancels it; if this
+    // transaction wins, the worker sees the updated opt-out before inserting.
+    if (revokedKinds.length) {
+      const recipientRoles = [
+        !reminderOptIn ? eq(medications.assigneeId, userId) : undefined,
+        !escalationOptIn
+          ? eq(medications.escalationRecipientId, userId)
+          : undefined,
+      ].filter(Boolean);
+      if (recipientRoles.length) {
+        await tx
+          .select({ id: medications.id })
+          .from(medications)
+          .where(
+            and(
+              eq(medications.familyId, familyId),
+              or(...recipientRoles as any[])
+            )
+          )
+          .orderBy(asc(medications.id))
+          .for("update");
+      }
+    }
+
+    await tx
+      .insert(notificationPreferences)
+      .values({ familyId, userId, reminderOptIn, escalationOptIn })
+      .onDuplicateKeyUpdate({ set: { reminderOptIn, escalationOptIn } });
+
+    if (revokedKinds.length) {
+      await tx
+        .update(notificationEvents)
+        .set({ status: "cancelled" })
+        .where(
+          and(
+            eq(notificationEvents.familyId, familyId),
+            eq(notificationEvents.recipientId, userId),
+            eq(notificationEvents.status, "created"),
+            or(...revokedKinds as any[])
+          )
+        );
+    }
+
+    return {
+      familyId,
+      reminderOptIn,
+      escalationOptIn,
+      emailDeliveryConfigured: false,
+      message:
+        "Saved consent for in-app notifications only. Email delivery is not configured; nothing is sent outside this app.",
+    };
+  });
 }
 
 export async function listInAppNotifications(userId: number, familyId: number) {
@@ -1172,42 +1235,253 @@ async function requireEscalationRecipientInFamily(userId: number | null | undefi
   if (!row?.memberId || row.optedIn !== true) throw new TRPCError({ code: "BAD_REQUEST", message: "Choose a current family member who has explicitly opted in to receive escalation alerts." });
 }
 
-/** Reconcile due instances into the durable in-app outbox; DB unique eventKey makes retries/restarts idempotent. This performs no network delivery. */
-export async function reconcileDueDoseNotifications(now = new Date()) {
+type DoseNotificationReconciliation = { created: number; checked: number };
+let doseNotificationReconciliationInFlight: Promise<DoseNotificationReconciliation> | null = null;
+
+/** Reconcile once at a time per process; database row locks serialize multiple instances. */
+export function reconcileDueDoseNotifications(
+  now = new Date()
+): Promise<DoseNotificationReconciliation> {
+  if (doseNotificationReconciliationInFlight)
+    return doseNotificationReconciliationInFlight;
+
+  const run = reconcileDueDoseNotificationsInternal(now);
+  let tracked: Promise<DoseNotificationReconciliation>;
+  tracked = run.finally(() => {
+    if (doseNotificationReconciliationInFlight === tracked)
+      doseNotificationReconciliationInFlight = null;
+  });
+  doseNotificationReconciliationInFlight = tracked;
+  return tracked;
+}
+
+/**
+ * Reconcile the durable in-app outbox. On startup after downtime, this catches
+ * up today and the previous six local calendar dates. Older missed occurrences
+ * are intentionally not replayed as a burst of stale reminders. No network
+ * delivery is performed.
+ */
+async function reconcileDueDoseNotificationsInternal(
+  now: Date
+): Promise<DoseNotificationReconciliation> {
   const db = await getDb();
   if (!db || !Number.isFinite(now.getTime())) return { created: 0, checked: 0 };
-  const meds = await db.select({ id: medications.id, familyId: medications.familyId, name: medications.name, doseTimes: medications.doseTimes, timeZone: medications.timeZone, startDate: medications.startDate, endDate: medications.endDate, assigneeId: medications.assigneeId, escalationRecipientId: medications.escalationRecipientId }).from(medications).where(eq(medications.active, true)).limit(1000);
   let created = 0, checked = 0;
-  for (const med of meds) {
-    const zone = isValidTimeZone(med.timeZone) ? med.timeZone : "UTC";
-    const today = dateKeyInZone(now, zone);
-    const dates = [today, new Date(Date.parse(`${today}T12:00:00Z`) - 86400000).toISOString().slice(0, 10)];
-    for (const doseDate of dates) {
-      if ((med.startDate && doseDate < med.startDate) || (med.endDate && doseDate > med.endDate)) continue;
-      for (const doseTime of storedDoseTimes(med.doseTimes)) {
-        const dueAt = doseTime === "once" ? null : scheduledDoseInstant(doseDate, doseTime, zone);
-        if (!dueAt || dueAt.getTime() > now.getTime()) continue;
-        checked++;
-        await db.transaction(async tx => {
-          // Confirmation takes the same medication-row lock. This closes the race where the worker
-          // might insert a notification after confirmation's cancellation pass.
-          const [locked] = await tx.select({ id: medications.id }).from(medications).where(and(eq(medications.id, med.id), eq(medications.familyId, med.familyId), eq(medications.active, true))).limit(1).for("update");
-          if (!locked) return;
-          const [confirmation] = await tx.select({ id: doseConfirmations.id }).from(doseConfirmations).where(and(eq(doseConfirmations.familyId, med.familyId), eq(doseConfirmations.medicationId, med.id), eq(doseConfirmations.doseDate, doseDate), eq(doseConfirmations.doseTime, doseTime))).limit(1);
-          if (confirmation) {
-            await tx.update(notificationEvents).set({ status: "cancelled" }).where(and(eq(notificationEvents.familyId, med.familyId), eq(notificationEvents.medicationId, med.id), eq(notificationEvents.doseDate, doseDate), eq(notificationEvents.doseTime, doseTime), or(eq(notificationEvents.status, "created"), eq(notificationEvents.status, "read"))));
-            return;
+  const pageSize = 250;
+  let lastMedicationId = 0;
+
+  while (true) {
+    const page = await db
+      .select({ id: medications.id, familyId: medications.familyId })
+      .from(medications)
+      .where(
+        and(eq(medications.active, true), gt(medications.id, lastMedicationId))
+      )
+      .orderBy(asc(medications.id))
+      .limit(pageSize);
+    if (page.length === 0) break;
+    lastMedicationId = page[page.length - 1]!.id;
+
+    for (const candidate of page) {
+      await db.transaction(async tx => {
+        // Re-read every field while holding the same medication-row lock used by
+        // confirmation, preference withdrawal, and medication edits.
+        const [med] = await tx
+          .select({
+            id: medications.id,
+            familyId: medications.familyId,
+            name: medications.name,
+            doseTimes: medications.doseTimes,
+            timeZone: medications.timeZone,
+            startDate: medications.startDate,
+            endDate: medications.endDate,
+            assigneeId: medications.assigneeId,
+            escalationRecipientId: medications.escalationRecipientId,
+            active: medications.active,
+          })
+          .from(medications)
+          .where(
+            and(
+              eq(medications.id, candidate.id),
+              eq(medications.familyId, candidate.familyId)
+            )
+          )
+          .limit(1)
+          .for("update");
+        if (!med) return;
+        if (!med.active) {
+          await tx
+            .update(notificationEvents)
+            .set({ status: "cancelled" })
+            .where(
+              and(
+                eq(notificationEvents.familyId, med.familyId),
+                eq(notificationEvents.medicationId, med.id),
+                eq(notificationEvents.status, "created")
+              )
+            );
+          return;
+        }
+
+        const zone = isValidTimeZone(med.timeZone) ? med.timeZone : "UTC";
+        const dates = recentLocalDoseDates(dateKeyInZone(now, zone));
+        const [assignee] = med.assigneeId
+          ? await tx
+              .select({
+                memberId: familyMembers.id,
+                optedIn: notificationPreferences.reminderOptIn,
+              })
+              .from(familyMembers)
+              .leftJoin(
+                notificationPreferences,
+                and(
+                  eq(notificationPreferences.familyId, familyMembers.familyId),
+                  eq(notificationPreferences.userId, familyMembers.userId)
+                )
+              )
+              .where(
+                and(
+                  eq(familyMembers.familyId, med.familyId),
+                  eq(familyMembers.userId, med.assigneeId)
+                )
+              )
+              .limit(1)
+          : [];
+        const [escalationRecipient] = med.escalationRecipientId
+          ? await tx
+              .select({
+                memberId: familyMembers.id,
+                optedIn: notificationPreferences.escalationOptIn,
+              })
+              .from(familyMembers)
+              .leftJoin(
+                notificationPreferences,
+                and(
+                  eq(notificationPreferences.familyId, familyMembers.familyId),
+                  eq(notificationPreferences.userId, familyMembers.userId)
+                )
+              )
+              .where(
+                and(
+                  eq(familyMembers.familyId, med.familyId),
+                  eq(familyMembers.userId, med.escalationRecipientId)
+                )
+              )
+              .limit(1)
+          : [];
+
+        for (const doseDate of dates) {
+          if (
+            (med.startDate && doseDate < med.startDate) ||
+            (med.endDate && doseDate > med.endDate)
+          )
+            continue;
+          for (const doseTime of storedDoseTimes(med.doseTimes)) {
+            const dueAt =
+              doseTime === "once"
+                ? null
+                : scheduledDoseInstant(doseDate, doseTime, zone);
+            if (!dueAt || dueAt.getTime() > now.getTime()) continue;
+            checked++;
+
+            const [confirmation] = await tx
+              .select({ id: doseConfirmations.id })
+              .from(doseConfirmations)
+              .where(
+                and(
+                  eq(doseConfirmations.familyId, med.familyId),
+                  eq(doseConfirmations.medicationId, med.id),
+                  eq(doseConfirmations.doseDate, doseDate),
+                  eq(doseConfirmations.doseTime, doseTime)
+                )
+              )
+              .limit(1);
+            if (confirmation) {
+              await tx
+                .update(notificationEvents)
+                .set({ status: "cancelled" })
+                .where(
+                  and(
+                    eq(notificationEvents.familyId, med.familyId),
+                    eq(notificationEvents.medicationId, med.id),
+                    eq(notificationEvents.doseDate, doseDate),
+                    eq(notificationEvents.doseTime, doseTime),
+                    or(
+                      eq(notificationEvents.status, "created"),
+                      eq(notificationEvents.status, "read")
+                    )
+                  )
+                );
+              continue;
+            }
+
+            const plans = planDoseNotifications({
+              medicationId: med.id,
+              medicationName: med.name,
+              doseDate,
+              doseTime,
+              timeZone: zone,
+              now,
+              assigneeId: med.assigneeId,
+              assigneeIsCurrentMember: !!assignee?.memberId,
+              assigneeReminderOptIn: assignee?.optedIn === true,
+              escalationRecipientId: med.escalationRecipientId,
+              escalationRecipientIsCurrentMember:
+                !!escalationRecipient?.memberId,
+              escalationRecipientOptIn:
+                escalationRecipient?.optedIn === true,
+              alreadyConfirmed: false,
+            });
+
+            for (const event of plans) {
+              const [existing] = await tx
+                .select({
+                  id: notificationEvents.id,
+                  status: notificationEvents.status,
+                })
+                .from(notificationEvents)
+                .where(eq(notificationEvents.eventKey, event.eventKey))
+                .limit(1);
+              if (existing) {
+                // A cancelled event may be reactivated only after the current
+                // schedule and explicit consent have been revalidated above.
+                if (existing.status === "cancelled") {
+                  await tx
+                    .update(notificationEvents)
+                    .set({
+                      status: "created",
+                      readAt: null,
+                      message: event.message,
+                      scheduledAt: event.scheduledAt,
+                    })
+                    .where(
+                      and(
+                        eq(notificationEvents.id, existing.id),
+                        eq(notificationEvents.status, "cancelled")
+                      )
+                    );
+                  created++;
+                }
+                continue;
+              }
+
+              await tx
+                .insert(notificationEvents)
+                .values({
+                  ...event,
+                  familyId: med.familyId,
+                  medicationId: med.id,
+                  emailDeliveryStatus: "not_configured",
+                })
+                .onDuplicateKeyUpdate({ set: { eventKey: event.eventKey } });
+              created++;
+            }
           }
-          const [assignee] = med.assigneeId ? await tx.select({ memberId: familyMembers.id, optedIn: notificationPreferences.reminderOptIn }).from(familyMembers).leftJoin(notificationPreferences, and(eq(notificationPreferences.familyId, familyMembers.familyId), eq(notificationPreferences.userId, familyMembers.userId))).where(and(eq(familyMembers.familyId, med.familyId), eq(familyMembers.userId, med.assigneeId))).limit(1) : [];
-          const [escalationRecipient] = med.escalationRecipientId ? await tx.select({ memberId: familyMembers.id, optedIn: notificationPreferences.escalationOptIn }).from(familyMembers).leftJoin(notificationPreferences, and(eq(notificationPreferences.familyId, familyMembers.familyId), eq(notificationPreferences.userId, familyMembers.userId))).where(and(eq(familyMembers.familyId, med.familyId), eq(familyMembers.userId, med.escalationRecipientId))).limit(1) : [];
-          const plans = planDoseNotifications({ medicationId: med.id, medicationName: med.name, doseDate, doseTime, timeZone: zone, now, assigneeId: med.assigneeId, assigneeIsCurrentMember: !!assignee?.memberId, assigneeReminderOptIn: assignee?.optedIn === true, escalationRecipientId: med.escalationRecipientId, escalationRecipientIsCurrentMember: !!escalationRecipient?.memberId, escalationRecipientOptIn: escalationRecipient?.optedIn === true, alreadyConfirmed: false });
-          for (const event of plans) {
-            await tx.insert(notificationEvents).values({ ...event, familyId: med.familyId, medicationId: med.id, emailDeliveryStatus: "not_configured" }).onDuplicateKeyUpdate({ set: { eventKey: event.eventKey } });
-            created++;
-          }
-        });
-      }
+        }
+      });
     }
+
+    if (page.length < pageSize) break;
   }
   return { created, checked };
 }
@@ -1355,24 +1629,6 @@ export async function updateMedication(
   requireWrite(role);
   const db = await getDb();
   if (!db) throw new TRPCError({ code: "SERVICE_UNAVAILABLE" });
-  const [medication] = await db
-    .select({
-      id: medications.id,
-      createdBy: medications.createdBy,
-      assigneeId: medications.assigneeId,
-    })
-    .from(medications)
-    .where(
-      and(eq(medications.id, medicationId), eq(medications.familyId, familyId))
-    )
-    .limit(1);
-  if (!medication) throw new TRPCError({ code: "NOT_FOUND" });
-  if (
-    !managers.includes(role) &&
-    medication.createdBy !== userId &&
-    medication.assigneeId !== userId
-  )
-    throw new TRPCError({ code: "FORBIDDEN" });
   await requireAssigneeInFamily(input.assigneeId, familyId);
   await requireEscalationRecipientInFamily(input.escalationRecipientId, familyId);
   const doseTimes = normalizeDoseTimes(input.doseTimes);
@@ -1381,19 +1637,79 @@ export async function updateMedication(
       code: "BAD_REQUEST",
       message: "Choose a valid IANA time zone.",
     });
-  await db
-    .update(medications)
-    .set({
-      ...input,
-      doseTimes: doseTimes.join(","),
-      name: input.name.trim(),
-      dose: input.dose.trim(),
-      schedule: input.schedule.trim(),
-    })
-    .where(
-      and(eq(medications.id, medicationId), eq(medications.familyId, familyId))
-    );
-  return { success: true };
+  return db.transaction(async tx => {
+    const [medication] = await tx
+      .select({
+        id: medications.id,
+        createdBy: medications.createdBy,
+        assigneeId: medications.assigneeId,
+        escalationRecipientId: medications.escalationRecipientId,
+        doseTimes: medications.doseTimes,
+        timeZone: medications.timeZone,
+        startDate: medications.startDate,
+        endDate: medications.endDate,
+        active: medications.active,
+      })
+      .from(medications)
+      .where(
+        and(eq(medications.id, medicationId), eq(medications.familyId, familyId))
+      )
+      .limit(1)
+      .for("update");
+    if (!medication) throw new TRPCError({ code: "NOT_FOUND" });
+    if (
+      !managers.includes(role) &&
+      medication.createdBy !== userId &&
+      medication.assigneeId !== userId
+    )
+      throw new TRPCError({ code: "FORBIDDEN" });
+
+    const nextAssigneeId =
+      input.assigneeId === undefined ? medication.assigneeId : input.assigneeId;
+    const nextEscalationRecipientId =
+      input.escalationRecipientId === undefined
+        ? medication.escalationRecipientId
+        : input.escalationRecipientId;
+    const nextStartDate =
+      input.startDate === undefined ? medication.startDate : input.startDate;
+    const nextEndDate =
+      input.endDate === undefined ? medication.endDate : input.endDate;
+    const scheduleChanged =
+      medication.doseTimes !== doseTimes.join(",") ||
+      medication.timeZone !== input.timeZone ||
+      medication.startDate !== nextStartDate ||
+      medication.endDate !== nextEndDate ||
+      medication.assigneeId !== nextAssigneeId ||
+      medication.escalationRecipientId !== nextEscalationRecipientId ||
+      medication.active !== input.active;
+
+    await tx
+      .update(medications)
+      .set({
+        ...input,
+        doseTimes: doseTimes.join(","),
+        name: input.name.trim(),
+        dose: input.dose.trim(),
+        schedule: input.schedule.trim(),
+      })
+      .where(
+        and(eq(medications.id, medicationId), eq(medications.familyId, familyId))
+      );
+
+    if (scheduleChanged) {
+      await tx
+        .update(notificationEvents)
+        .set({ status: "cancelled" })
+        .where(
+          and(
+            eq(notificationEvents.familyId, familyId),
+            eq(notificationEvents.medicationId, medicationId),
+            eq(notificationEvents.status, "created")
+          )
+        );
+    }
+    return { success: true };
+  });
 }
 
 export async function confirmDose(

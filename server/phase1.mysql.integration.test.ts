@@ -25,6 +25,7 @@ import {
   familyInvitations,
   familyMembers,
   medications,
+  notificationEvents,
   users,
 } from "../drizzle/schema";
 import { appRouter, type AppRouter } from "./routers";
@@ -604,6 +605,9 @@ suite("Care Circle against an isolated local MySQL database", () => {
       enabled: false,
     });
 
+    await expect(
+      owner.care.phase3.notificationPreferences.query({ familyId: familyA.id })
+    ).resolves.toMatchObject({ reminderOptIn: false, escalationOptIn: false });
     await owner.care.phase3.setNotificationPreferences.mutate({
       familyId: familyA.id,
       reminderOptIn: true,
@@ -640,6 +644,31 @@ suite("Care Circle against an isolated local MySQL database", () => {
     expect(notificationMedicationRow?.id).toBeTruthy();
     vi.setSystemTime(new Date("2026-10-29T00:10:00.000Z"));
     await reconcileDueDoseNotifications(new Date());
+    const firstPassEvents = await database!
+      .select({ kind: notificationEvents.kind, status: notificationEvents.status })
+      .from(notificationEvents)
+      .where(
+        and(
+          eq(notificationEvents.familyId, familyA.id),
+          eq(notificationEvents.medicationId, notificationMedicationRow!.id)
+        )
+      );
+    expect(firstPassEvents.map(event => event.kind).sort()).toEqual([
+      "due_reminder",
+      "unconfirmed_10m",
+    ]);
+    expect(firstPassEvents.every(event => event.status === "created")).toBe(true);
+    expect((await reconcileDueDoseNotifications(new Date())).created).toBe(0);
+    const afterRetryEvents = await database!
+      .select({ id: notificationEvents.id })
+      .from(notificationEvents)
+      .where(
+        and(
+          eq(notificationEvents.familyId, familyA.id),
+          eq(notificationEvents.medicationId, notificationMedicationRow!.id)
+        )
+      );
+    expect(afterRetryEvents).toHaveLength(2);
     const dueInbox = await owner.care.phase3.inbox.query({
       familyId: familyA.id,
     });
@@ -668,6 +697,158 @@ suite("Care Circle against an isolated local MySQL database", () => {
         .filter(item => item.doseTime === "00:00")
         .every(item => item.status === "cancelled")
     ).toBe(true);
+
+    // Simulate a server outage by leaving this dose un-reconciled until several
+    // local dates later. Startup reconciliation must restore all eligible stages.
+    const recoveryMedication = await owner.care.medications.create.mutate({
+      familyId: familyA.id,
+      name: "Restart recovery integration medication",
+      dose: "As prescribed",
+      schedule: "Daily",
+      doseTimes: "00:00",
+      timeZone: "UTC",
+      startDate: "2026-10-23",
+      endDate: "2026-10-23",
+      assigneeId: identities[0]!.id,
+      escalationRecipientId: identities[2]!.id,
+    });
+    expect(recoveryMedication.success).toBe(true);
+    const [recoveryMedicationRow] = await database!
+      .select({ id: medications.id })
+      .from(medications)
+      .where(
+        and(
+          eq(medications.familyId, familyA.id),
+          eq(medications.name, "Restart recovery integration medication")
+        )
+      )
+      .limit(1);
+    expect(recoveryMedicationRow?.id).toBeTruthy();
+    await reconcileDueDoseNotifications(new Date());
+    const recoveredEvents = await database!
+      .select({ kind: notificationEvents.kind, eventKey: notificationEvents.eventKey })
+      .from(notificationEvents)
+      .where(
+        and(
+          eq(notificationEvents.familyId, familyA.id),
+          eq(notificationEvents.medicationId, recoveryMedicationRow!.id)
+        )
+      );
+    expect(recoveredEvents.map(event => event.kind).sort()).toEqual([
+      "due_reminder",
+      "escalation_20m",
+      "unconfirmed_10m",
+    ]);
+    expect(new Set(recoveredEvents.map(event => event.eventKey)).size).toBe(3);
+    await reconcileDueDoseNotifications(new Date());
+    const recoveredRetryEvents = await database!
+      .select({ id: notificationEvents.id })
+      .from(notificationEvents)
+      .where(
+        and(
+          eq(notificationEvents.familyId, familyA.id),
+          eq(notificationEvents.medicationId, recoveryMedicationRow!.id)
+        )
+      );
+    expect(recoveredRetryEvents).toHaveLength(3);
+
+    // Schedule edits cancel old pending events under the same row lock used by
+    // reconciliation; the new schedule becomes eligible normally.
+    const editableMedication = await owner.care.medications.create.mutate({
+      familyId: familyA.id,
+      name: "Schedule edit integration medication",
+      dose: "As prescribed",
+      schedule: "Daily",
+      doseTimes: "00:30",
+      timeZone: "UTC",
+      startDate: "2026-10-29",
+      endDate: "2026-10-29",
+      assigneeId: identities[0]!.id,
+      escalationRecipientId: identities[2]!.id,
+    });
+    expect(editableMedication.success).toBe(true);
+    const [editableMedicationRow] = await database!
+      .select({ id: medications.id })
+      .from(medications)
+      .where(
+        and(
+          eq(medications.familyId, familyA.id),
+          eq(medications.name, "Schedule edit integration medication")
+        )
+      )
+      .limit(1);
+    expect(editableMedicationRow?.id).toBeTruthy();
+    vi.setSystemTime(new Date("2026-10-29T00:50:00.000Z"));
+    await reconcileDueDoseNotifications(new Date());
+    const scheduleEdit = await owner.care.medications.update.mutate({
+      familyId: familyA.id,
+      medicationId: editableMedicationRow!.id,
+      name: "Schedule edit integration medication",
+      dose: "As prescribed",
+      schedule: "Daily",
+      doseTimes: "01:00",
+      timeZone: "UTC",
+      startDate: "2026-10-29",
+      endDate: "2026-10-29",
+      notes: null,
+      assigneeId: identities[0]!.id,
+      escalationRecipientId: identities[2]!.id,
+      active: true,
+    });
+    expect(scheduleEdit.success).toBe(true);
+    const oldScheduleEvents = await database!
+      .select({ status: notificationEvents.status })
+      .from(notificationEvents)
+      .where(
+        and(
+          eq(notificationEvents.familyId, familyA.id),
+          eq(notificationEvents.medicationId, editableMedicationRow!.id),
+          eq(notificationEvents.doseTime, "00:30")
+        )
+      );
+    expect(oldScheduleEvents).toHaveLength(3);
+    expect(oldScheduleEvents.every(event => event.status === "cancelled")).toBe(true);
+    vi.setSystemTime(new Date("2026-10-29T01:30:00.000Z"));
+    await reconcileDueDoseNotifications(new Date());
+    const newScheduleEvents = await database!
+      .select({ kind: notificationEvents.kind, status: notificationEvents.status })
+      .from(notificationEvents)
+      .where(
+        and(
+          eq(notificationEvents.familyId, familyA.id),
+          eq(notificationEvents.medicationId, editableMedicationRow!.id),
+          eq(notificationEvents.doseTime, "01:00")
+        )
+      );
+    expect(newScheduleEvents).toHaveLength(3);
+    expect(newScheduleEvents.every(event => event.status === "created")).toBe(true);
+
+    await Promise.all([
+      owner.care.phase3.setNotificationPreferences.mutate({
+        familyId: familyA.id,
+        reminderOptIn: false,
+        escalationOptIn: false,
+      }),
+      successor.care.phase3.setNotificationPreferences.mutate({
+        familyId: familyA.id,
+        reminderOptIn: false,
+        escalationOptIn: false,
+      }),
+      reconcileDueDoseNotifications(new Date()),
+    ]);
+    const withdrawnEvents = await database!
+      .select({ kind: notificationEvents.kind, status: notificationEvents.status })
+      .from(notificationEvents)
+      .where(
+        and(
+          eq(notificationEvents.familyId, familyA.id),
+          eq(notificationEvents.medicationId, editableMedicationRow!.id),
+          eq(notificationEvents.doseTime, "01:00")
+        )
+    );
+    expect(withdrawnEvents).toHaveLength(3);
+    expect(withdrawnEvents.every(event => event.status === "cancelled")).toBe(true);
+    expect((await reconcileDueDoseNotifications(new Date())).created).toBe(0);
     const exportBeforeDelete = await successor.care.families.export.mutate({
       familyId: familyA.id,
     });

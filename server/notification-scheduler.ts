@@ -1,5 +1,16 @@
 import { scheduledDoseInstant } from "../shared/timezone";
 
+export const DOSE_NOTIFICATION_CATCH_UP_DAYS = 7;
+
+/** Include today and the previous six local calendar dates after a restart. */
+export function recentLocalDoseDates(today: string): string[] {
+  const [year, month, day] = today.split("-").map(Number);
+  const todayAtUtcNoon = Date.UTC(year!, month! - 1, day!, 12);
+  return Array.from({ length: DOSE_NOTIFICATION_CATCH_UP_DAYS }, (_, offset) =>
+    new Date(todayAtUtcNoon - offset * 86_400_000).toISOString().slice(0, 10)
+  );
+}
+
 export type NotificationKind =
   | "due_reminder"
   | "unconfirmed_10m"
