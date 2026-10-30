@@ -56,4 +56,6 @@
 
 - الفرع: `secondary-maintenance`
 - لن يُدمج في `main`.
-- سيُثبت رابط آخر commit الفعلي في رسالة التسليم بعد إنشاء commit المحلي/دفع الفرع المستقل إن كان مسموحًا به؛ لا يوجد نشر للتطبيق.
+- commit التنفيذ الذي يحتوي الإصلاحات والوثائق: [`0c8a04f`](https://github.com/mojtabahamed163-ai/Care-Circle/commit/0c8a04ffbbb4ac015dbcd4d89983dc30d276769c).
+- أحدث سجل للفرع المستقل: [commits/secondary-maintenance](https://github.com/mojtabahamed163-ai/Care-Circle/commits/secondary-maintenance).
+- لا يوجد نشر للتطبيق؛ الدفع اقتصر على الفرع المستقل.
