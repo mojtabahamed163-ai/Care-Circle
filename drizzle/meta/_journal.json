@@ -64,6 +64,13 @@
       "when": 1793290888658,
       "tag": "0008_phase2_in_app_dose_notifications",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "5",
+      "when": 1793473347890,
+      "tag": "0009_session_revocations",
+      "breakpoints": true
     }
   ]
 }

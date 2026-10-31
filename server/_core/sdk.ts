@@ -4,7 +4,10 @@ import axios, { type AxiosInstance } from "axios";
 import { parse as parseCookieHeader } from "cookie";
 import type { Request } from "express";
 import { SignJWT, jwtVerify } from "jose";
+import { createHash } from "node:crypto";
 import type { User } from "../../drizzle/schema";
+import { eq } from "drizzle-orm";
+import { sessionRevocations } from "../../drizzle/schema";
 import * as db from "../db";
 import { ENV } from "./env";
 import type {
@@ -17,6 +20,9 @@ import type {
 // Utility function
 const isNonEmptyString = (value: unknown): value is string =>
   typeof value === "string" && value.length > 0;
+
+const hashSessionToken = (token: string) =>
+  createHash("sha256").update(token).digest("hex");
 
 export type SessionPayload = {
   openId: string;
@@ -197,6 +203,42 @@ class SDKServer {
       .sign(secretKey);
   }
 
+  async revokeSessionForRequest(req: Request): Promise<void> {
+    const cookies = this.parseCookies(req.headers.cookie);
+    const cookieToken = cookies.get(COOKIE_NAME);
+    const bearerToken =
+      typeof req.headers.authorization === "string" &&
+      req.headers.authorization.startsWith("Bearer ")
+        ? req.headers.authorization.slice(7)
+        : undefined;
+    const token = cookieToken ?? bearerToken;
+    if (!token) return;
+
+    try {
+      const secretKey = this.getSessionSecret();
+      const { payload } = await jwtVerify(token, secretKey, {
+        algorithms: ["HS256"],
+      });
+      const expiresAt =
+        typeof payload.exp === "number"
+          ? new Date(payload.exp * 1000)
+          : new Date(Date.now() + ONE_YEAR_MS);
+      if (process.env.DATABASE_URL) {
+        const database = await db.getDb();
+        if (!database) return;
+        await database
+          .insert(sessionRevocations)
+          .values({ tokenHash: hashSessionToken(token), expiresAt })
+          .onDuplicateKeyUpdate({ set: { revokedAt: new Date(), expiresAt } });
+      }
+    } catch (error) {
+      console.warn(
+        "[Auth] Session revocation failed",
+        error instanceof Error ? error.message : "unknown error"
+      );
+    }
+  }
+
   async verifySession(
     cookieValue: string | undefined | null
   ): Promise<{ openId: string; appId: string; name: string } | null> {
@@ -219,6 +261,23 @@ class SDKServer {
       ) {
         console.warn("[Auth] Session payload missing required fields");
         return null;
+      }
+
+      if (process.env.DATABASE_URL) {
+        const database = await db.getDb();
+        if (database) {
+          const [revoked] = await database
+            .select({ tokenHash: sessionRevocations.tokenHash })
+            .from(sessionRevocations)
+            .where(
+              eq(sessionRevocations.tokenHash, hashSessionToken(cookieValue))
+            )
+            .limit(1);
+          if (revoked) {
+            console.warn("[Auth] Session token has been revoked");
+            return null;
+          }
+        }
       }
 
       return {

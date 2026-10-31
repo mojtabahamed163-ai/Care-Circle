@@ -957,5 +957,8 @@ suite("Care Circle against an isolated local MySQL database", () => {
     await expect(
       successor.care.families.export.mutate({ familyId: familyA.id })
     ).resolves.toMatchObject({ family: { id: familyA.id } });
+
+    await successor.auth.logout.mutate();
+    await expect(successor.care.families.list.query()).rejects.toBeDefined();
   });
 });

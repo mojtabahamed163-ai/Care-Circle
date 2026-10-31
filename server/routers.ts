@@ -3,6 +3,7 @@ import { z } from "zod";
 import { COOKIE_NAME } from "@shared/const";
 import { isValidTimeZone } from "../shared/timezone";
 import { getSessionCookieOptions } from "./_core/cookies";
+import { sdk } from "./_core/sdk";
 import { systemRouter } from "./_core/systemRouter";
 import { protectedProcedure, publicProcedure, router } from "./_core/trpc";
 import { isDoseTimesValid } from "./care-utils";
@@ -49,12 +50,14 @@ export const appRouter = router({
   system: systemRouter,
   auth: router({
     me: publicProcedure.query(opts => opts.ctx.user),
-    logout: publicProcedure.mutation(({ ctx }) => {
+    logout: publicProcedure.mutation(async ({ ctx }) => {
+      await sdk.revokeSessionForRequest(ctx.req);
       const cookieOptions = getSessionCookieOptions(ctx.req);
       ctx.res.clearCookie(COOKIE_NAME, cookieOptions);
       return { success: true } as const;
     }),
     deleteAccount: protectedProcedure.mutation(async ({ ctx }) => {
+      await sdk.revokeSessionForRequest(ctx.req);
       const result = await care.deleteAccount(ctx.user.id);
       ctx.res.clearCookie(COOKIE_NAME, getSessionCookieOptions(ctx.req));
       return result;
