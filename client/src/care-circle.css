@@ -1,3 +1,10 @@
+html,
+body,
+#root {
+  max-width: 100%;
+  overflow-x: hidden;
+}
+
 .brand-lockup {
   align-items: center;
   gap: 10px;
@@ -1437,9 +1444,9 @@
   border: 1px solid #e2e7e1;
   border-radius: 7px;
   width: 100%;
-  min-height: 38px;
+  min-height: 44px;
   padding: 9px 10px;
-  font-size: 11px;
+  font-size: 16px;
   font-weight: 450;
 }
 .field textarea {

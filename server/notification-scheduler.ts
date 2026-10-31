@@ -1,5 +1,7 @@
 import { scheduledDoseInstant } from "../shared/timezone";
 
+const MAX_NOTIFICATION_MESSAGE_LENGTH = 255;
+
 export const DOSE_NOTIFICATION_CATCH_UP_DAYS = 7;
 
 /** Include today and the previous six local calendar dates after a restart. */
@@ -98,7 +100,9 @@ export function planDoseNotifications(input: {
         doseDate,
         doseTime,
         scheduledAt,
-        message,
+        // Keep the planner aligned with the durable varchar(255) column even
+        // when a valid 180-character medication name is supplied.
+        message: message.slice(0, MAX_NOTIFICATION_MESSAGE_LENGTH),
       },
     ];
   });

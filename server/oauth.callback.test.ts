@@ -161,4 +161,17 @@ describe("Manus OAuth callback", () => {
     expect(response.body).toEqual({ error: "code and state are required" });
     expect(oauthMocks.exchangeCodeForToken).not.toHaveBeenCalled();
   });
+
+  it("rejects malformed state as a CSRF failure instead of throwing", async () => {
+    const response = makeResponse();
+    await callbackHandler()(
+      makeRequest("not-valid-base64-state", "some-nonce"),
+      response
+    );
+
+    expect(response.statusCode).toBe(403);
+    expect(response.body).toEqual({ error: "invalid oauth state" });
+    expect(oauthMocks.exchangeCodeForToken).not.toHaveBeenCalled();
+    expect(databaseMocks.upsertUser).not.toHaveBeenCalled();
+  });
 });

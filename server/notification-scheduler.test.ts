@@ -97,6 +97,16 @@ describe("dose notification planner", () => {
     ).toEqual([]);
   });
 
+  it("keeps durable notification messages within the database column limit", () => {
+    const result = planDoseNotifications({
+      ...base,
+      medicationName: "x".repeat(180),
+      now: instant("2026-11-01T05:50:00Z"),
+    });
+    expect(result).toHaveLength(3);
+    expect(result.every(event => event.message.length <= 255)).toBe(true);
+  });
+
   it("reconciles today and the previous six local dates across month boundaries", () => {
     expect(DOSE_NOTIFICATION_CATCH_UP_DAYS).toBe(7);
     expect(recentLocalDoseDates("2026-03-01")).toEqual([
