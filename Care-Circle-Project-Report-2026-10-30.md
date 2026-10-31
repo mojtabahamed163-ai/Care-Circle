@@ -68,6 +68,7 @@
 - إصلاح نافذة الدعوة ووضوح حقول الهاتف: [`c016955`](https://github.com/mojtabahamed163-ai/Care-Circle/commit/c016955d855adb0d2522344f0439a0fceed752f5).
 - تحديث سجل التحقق والتقرير: [`b32542c`](https://github.com/mojtabahamed163-ai/Care-Circle/commit/b32542cfe7c9fbf2a48123cc27b8c3f2947694a9).
 - أرشفة تقرير Word: [`d72864b`](https://github.com/mojtabahamed163-ai/Care-Circle/commit/d72864bbe3b788ed8a978bed1206226e414aba01).
+- إصلاحات موثوقية الإشعارات واختبارات MariaDB ودليل الهاتف وقالب البيئة المحلي: [`1ae0e52`](https://github.com/mojtabahamed163-ai/Care-Circle/commit/1ae0e528d28869109961a04b6b7e6516aede0134).
 
 توضح وثائق Manus أن أرصدة إنشاء الموقع منفصلة عن استخدام WebDev وأن موارد الاستضافة وقاعدة البيانات تدخل ضمن الاستهلاك؛ لم يُنشر Care Circle ولم يُقَس استهلاكه على بيئة حيّة، فلا يمكن ضمان تشغيل مجاني بلا حدود. [5] [6] [7]
 
