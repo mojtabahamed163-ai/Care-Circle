@@ -1,4 +1,9 @@
-import { AXIOS_TIMEOUT_MS, COOKIE_NAME, ONE_YEAR_MS, decodeOAuthState } from "@shared/const";
+import {
+  AXIOS_TIMEOUT_MS,
+  COOKIE_NAME,
+  ONE_YEAR_MS,
+  decodeOAuthState,
+} from "@shared/const";
 import { ForbiddenError } from "@shared/_core/errors";
 import axios, { type AxiosInstance } from "axios";
 import { parse as parseCookieHeader } from "cookie";
@@ -211,25 +216,38 @@ class SDKServer {
       req.headers.authorization.startsWith("Bearer ")
         ? req.headers.authorization.slice(7)
         : undefined;
-    const token = cookieToken ?? bearerToken;
-    if (!token) return;
+    const tokens = Array.from(
+      new Set(
+        [cookieToken, bearerToken].filter((token): token is string => !!token)
+      )
+    );
+    if (tokens.length === 0) return;
 
     try {
       const secretKey = this.getSessionSecret();
-      const { payload } = await jwtVerify(token, secretKey, {
-        algorithms: ["HS256"],
-      });
-      const expiresAt =
-        typeof payload.exp === "number"
-          ? new Date(payload.exp * 1000)
-          : new Date(Date.now() + ONE_YEAR_MS);
-      if (process.env.DATABASE_URL) {
-        const database = await db.getDb();
-        if (!database) return;
-        await database
-          .insert(sessionRevocations)
-          .values({ tokenHash: hashSessionToken(token), expiresAt })
-          .onDuplicateKeyUpdate({ set: { revokedAt: new Date(), expiresAt } });
+      const database = process.env.DATABASE_URL ? await db.getDb() : null;
+      if (!database) return;
+      for (const token of tokens) {
+        try {
+          const { payload } = await jwtVerify(token, secretKey, {
+            algorithms: ["HS256"],
+          });
+          const expiresAt =
+            typeof payload.exp === "number"
+              ? new Date(payload.exp * 1000)
+              : new Date(Date.now() + ONE_YEAR_MS);
+          await database
+            .insert(sessionRevocations)
+            .values({ tokenHash: hashSessionToken(token), expiresAt })
+            .onDuplicateKeyUpdate({
+              set: { revokedAt: new Date(), expiresAt },
+            });
+        } catch (error) {
+          console.warn(
+            "[Auth] Session revocation skipped for invalid token",
+            error instanceof Error ? error.message : "unknown error"
+          );
+        }
       }
     } catch (error) {
       console.warn(
@@ -256,7 +274,8 @@ class SDKServer {
 
       if (
         !isNonEmptyString(openId) ||
-        (!isNonEmptyString(appId) || appId !== ENV.appId) ||
+        !isNonEmptyString(appId) ||
+        appId !== ENV.appId ||
         typeof name !== "string"
       ) {
         console.warn("[Auth] Session payload missing required fields");
@@ -322,7 +341,8 @@ class SDKServer {
     if (!sessionToken && req.path.startsWith("/api/scheduled/")) {
       const ticket = cookies.get("app_session_id");
       const identity = await this.verifySession(ticket);
-      if (identity?.openId.startsWith(CRON_OPEN_ID_PREFIX)) sessionToken = ticket;
+      if (identity?.openId.startsWith(CRON_OPEN_ID_PREFIX))
+        sessionToken = ticket;
     }
 
     // 2. Fallback to the Authorization header (Preview auto-login via
